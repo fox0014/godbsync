@@ -1,0 +1,28 @@
+# PostgreSQL → MySQL 同步示例
+# PostgreSQL 作为源端（Reader），MySQL 作为目标端（Writer）。
+# 进度默认存本地 SQLite（godbsync.db）；也可在 state 段改用独立 MySQL。
+source:
+  dialect: postgresql
+  host: 127.0.0.1
+  port: 5432
+  username: postgres
+  password: pgpass
+  database: srcdb          # 必填：PostgreSQL 数据库名
+  schema: public           # 可选：源表缺省 schema（默认 public）
+  # encrypt: disable       # 可选：覆盖 sslmode（require/verify-ca/verify-full）
+
+target:
+  dialect: mysql
+  host: 127.0.0.1
+  port: 3306
+  username: root
+  password: mysqlpass
+  database: dstdb          # 必填：MySQL 数据库名
+
+tables:
+  - name: orders
+    schema: public         # 可表级覆盖 schema
+    mode: full
+  - name: users
+    mode: incremental
+    watermark: id          # 增量模式必须指定单调水位列

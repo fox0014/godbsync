@@ -1,0 +1,67 @@
+# godbsync 示例配置
+# 复制本文件为 config.yaml 并按实际环境修改。
+
+# ===== 源库 =====
+source:
+  dialect: oracle            # 源数据库类型：oracle / mysql
+  host: 10.0.0.11          # 主机地址
+  port: 1521               # 监听端口（默认 1521）
+  username: hr             # 用户名
+  password: hr_pass        # 密码
+  service: ORCLPDB1        # 服务名或 SID（dialect=oracle 时必填）
+  conn_type: service       # service=使用服务名（默认）; sid=使用 SID
+  schema: HR               # 源表缺省属主（schema），表属于其他用户时必填；
+                           # 留空则按当前连接用户解析；单表可用 tables[].schema 覆盖
+
+# ===== 目标库 =====
+target:
+  dialect: mysql            # 目标数据库类型：mysql / oracle
+  host: 10.0.0.21
+  port: 3306
+  database: sync_target    # 目标数据库名（需提前创建，dialect=mysql 时必填）
+  username: sync
+  password: sync_pass
+  charset: utf8mb4
+  timezone: UTC             # 时间列存储时区，默认 UTC（推荐）；
+                           # 可选 "Local" 或 IANA 时区名如 "Asia/Shanghai"
+
+# ===== 进度存储（水位表/断点表存放位置）=====
+state:
+  backend: sqlite          # sqlite（默认，本地文件，无需额外组件）或 mysql（存于独立进度库）
+  path: godbsync.db        # SQLite 文件路径（仅 backend=sqlite 时生效；默认 godbsync.db）
+                           # mysql 后端需在 state.mysql 段配置独立进度库连接（与目标库解耦）
+                           # CLI -state 标志可覆盖本段配置：-state mysql 或 -state file=./other.db
+
+# ===== 全局选项 =====
+workers: 4                 # 单表写入并发 worker 数
+batch_size: 2000           # 全局每批写入行数（默认 1000）；表级 tables[].batch_size 优先
+                           # Oracle 源读取会按 batch_size × 4 作为数组抓取(PREFETCH_ROWS)行数，
+                           # 进一步减少源端网络往返（上限 50000 保护）
+log_level: info            # debug / info / warn / error
+auto_validate: true        # 同步完成后自动校验两侧行数（true/false，默认 true，省略也为 true）
+validate_sample_size: 100   # 内容校验按主键抽样的行数（默认 100，建议覆盖大表时调小）
+# validate_sample_offset: 0   # 抽样起点（按主键排序后跳过的行数，默认 0=表头）
+# validate_sample_random: false  # 抽样起点是否在表内随机选取（避免总是抽样小主键区间）
+# watermark_checkpoint_interval: 10  # 增量水位周期检查点间隔（秒，默认 10）；
+#                                    # 运行期间每达到该间隔即持久化一次已提交水位，中断只需补剩余
+
+# ===== 待同步表 =====
+tables:
+  # 全量同步示例：每次先清空目标表再全量写入（配置 truncate: true）
+  - name: EMPLOYEES        # Oracle 源表名（未加引号按大写匹配）
+    schema: HR             # 可选：覆盖 oracle.schema，指定本表属主
+    target: employees      # MySQL 目标表名（可选，省略则与 name 相同）
+    mode: full
+    truncate: true         # 写入前清空目标表
+    batch_size: 2000       # 每批写入行数
+    # column_mapping:      # Oracle列名→MySQL列名的映射（仅需配置名称不同的列）
+    #   EMP_ID: employee_id
+    #   FIRST_NAME: first_name
+
+  # 增量同步示例：基于水位列 LAST_MODIFIED 持续推进
+  - name: ORDERS
+    target: orders
+    mode: incremental
+    watermark: LAST_MODIFIED   # 单调列（时间戳或自增主键）
+    batch_size: 1000
+    ignore_errors: false       # 单批失败即终止

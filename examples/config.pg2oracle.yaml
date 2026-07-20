@@ -1,0 +1,26 @@
+# PostgreSQL → Oracle 同步示例
+# PostgreSQL 作为源端（Reader），Oracle 作为目标端（Writer）。
+source:
+  dialect: postgresql
+  host: 127.0.0.1
+  port: 5432
+  username: postgres
+  password: pgpass
+  database: srcdb
+  schema: public
+
+target:
+  dialect: oracle
+  host: 127.0.0.1
+  port: 1521
+  username: target_user
+  password: orapass
+  service: orcl           # 必填：Oracle 服务名（12c+ 多租户用 service）
+  conn_type: service      # service（默认）或 sid
+
+tables:
+  - name: orders
+    mode: full
+  - name: users
+    mode: incremental
+    watermark: id

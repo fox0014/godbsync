@@ -1,0 +1,29 @@
+# SQL Server → PostgreSQL 同步示例
+# SQL Server 作为源端（Reader），PostgreSQL 作为目标端（Writer）。
+# 幂等写入：PostgreSQL 目标用 INSERT ... ON CONFLICT (pk) DO UPDATE（无主键退化为普通 INSERT）。
+# 进度默认存本地 SQLite（godbsync.db）；也可在 state 段改用独立 MySQL。
+source:
+  dialect: sqlserver
+  host: 127.0.0.1
+  port: 1433
+  username: srcuser
+  password: srcpass
+  database: srcdb          # 必填：SQL Server 数据库名
+  schema: dbo              # 可选：源表缺省 schema（默认 dbo）
+
+target:
+  dialect: postgresql
+  host: 127.0.0.1
+  port: 5432
+  username: postgres
+  password: pgpass
+  database: dstdb          # 必填：PostgreSQL 数据库名
+  schema: public           # 可选：目标表缺省 schema（默认 public）
+  # encrypt: disable       # 可选：覆盖 sslmode（require/verify-ca/verify-full）
+
+tables:
+  - name: orders
+    mode: full
+  - name: users
+    mode: incremental
+    watermark: id          # 增量模式必须指定单调水位列

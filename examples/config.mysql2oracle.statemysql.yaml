@@ -1,0 +1,57 @@
+# godbsync 示例配置：MySQL -> Oracle 同步（进度存独立 MySQL）
+# 复制本文件为 config.yaml 并按实际环境修改。
+# 与 config.mysql2oracle.yaml 的区别：进度后端使用「独立 MySQL」（state.mysql 段），
+# 因此目标库为 Oracle 时也能用 mysql 后端——进度与运行环境解耦、可集中管理。
+
+# ===== 源库（MySQL）=====
+source:
+  dialect: mysql
+  host: 10.0.0.21
+  port: 3306
+  username: sync
+  password: sync_pass
+  database: sync_src
+  charset: utf8mb4
+  timezone: UTC
+
+# ===== 目标库（Oracle）=====
+target:
+  dialect: oracle
+  host: 10.0.0.11
+  port: 1521
+  username: hr
+  password: hr_pass
+  service: ORCLPDB1
+  conn_type: service
+
+# ===== 进度存储：独立 MySQL（与目标 Oracle 库无关）=====
+state:
+  backend: mysql
+  mysql:
+    host: 10.0.0.99            # 独立进度库地址（任意 MySQL，不必是同步目标库）
+    port: 3306
+    username: godbsync
+    password: godbsync_pass
+    database: godbsync_state   # 进度表 godbsync_watermark / godbsync_checkpoint 将建在该库
+    charset: utf8mb4
+    timezone: UTC
+
+# ===== 全局选项 =====
+workers: 4
+log_level: info
+auto_validate: true
+validate_sample_size: 100
+
+# ===== 待同步表 =====
+tables:
+  - name: employees
+    target: EMPLOYEES
+    mode: full
+    truncate: true
+    batch_size: 2000
+  - name: orders
+    target: ORDERS
+    mode: incremental
+    watermark: updated_at
+    batch_size: 1000
+    ignore_errors: false

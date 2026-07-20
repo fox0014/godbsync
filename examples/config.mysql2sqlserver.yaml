@@ -1,0 +1,50 @@
+# godbsync 示例配置：MySQL -> SQL Server 同步
+# 复制本文件为 config.yaml 并按实际环境修改。
+
+# ===== 源库（MySQL）=====
+source:
+  dialect: mysql
+  host: 10.0.0.21
+  port: 3306
+  username: sync
+  password: sync_pass
+  database: sync_src
+  charset: utf8mb4
+  timezone: UTC
+
+# ===== 目标库（SQL Server）=====
+target:
+  dialect: sqlserver
+  host: 10.0.0.31
+  port: 1433
+  username: sa
+  password: your_password
+  database: sync_tgt          # 目标数据库名
+  schema: dbo                 # 目标表缺省 schema（默认 dbo）
+  # encrypt: true             # 连 Azure SQL / 开启强制加密的实例时启用（默认 disable，兼容自签名）
+
+# ===== 进度存储 =====
+# 目标库为 SQL Server 时，进度后端可用 sqlite 或「独立 MySQL」（state.mysql 段）。
+state:
+  backend: sqlite
+  path: godbsync.db
+
+# ===== 全局选项 =====
+workers: 4
+log_level: info
+auto_validate: true
+validate_sample_size: 100
+
+# ===== 待同步表 =====
+tables:
+  - name: employees           # MySQL 源表名
+    target: Employees         # SQL Server 目标表名
+    mode: full
+    truncate: true
+    batch_size: 2000
+  - name: orders
+    target: Orders
+    mode: incremental
+    watermark: updated_at
+    batch_size: 1000
+    ignore_errors: false

@@ -1,0 +1,51 @@
+# godbsync 示例配置：SQL Server -> MySQL 同步
+# 复制本文件为 config.yaml 并按实际环境修改。
+
+# ===== 源库（SQL Server）=====
+source:
+  dialect: sqlserver
+  host: 10.0.0.31
+  port: 1433
+  username: sa
+  password: your_password
+  database: sync_src          # 源数据库名
+  schema: dbo                 # 源表缺省 schema（默认 dbo）
+  # encrypt: true             # 连 Azure SQL / 开启强制加密的实例时启用（默认 disable，兼容自签名）
+
+# ===== 目标库（MySQL）=====
+target:
+  dialect: mysql
+  host: 10.0.0.21
+  port: 3306
+  username: sync
+  password: sync_pass
+  database: sync_tgt
+  charset: utf8mb4
+  timezone: UTC
+
+# ===== 进度存储（水位表/断点表存放位置）=====
+state:
+  backend: sqlite             # sqlite（默认）或 mysql（需配 state.mysql 段）
+  path: godbsync.db
+
+# ===== 全局选项 =====
+workers: 4
+log_level: info
+auto_validate: true
+validate_sample_size: 100
+
+# ===== 待同步表 =====
+tables:
+  - name: Employees           # SQL Server 源表名
+    schema: dbo               # 可省略，使用 source.schema
+    target: employees         # MySQL 目标表名（可省略，默认与 name 相同）
+    mode: full                # full（全量）或 incremental（增量）
+    truncate: true            # 全量同步前清空目标表
+    batch_size: 2000
+  - name: Orders
+    schema: dbo
+    target: orders
+    mode: incremental
+    watermark: updated_at     # 增量水位列（需为单调递增的 datetime/int）
+    batch_size: 1000
+    ignore_errors: false

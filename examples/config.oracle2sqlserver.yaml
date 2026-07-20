@@ -1,0 +1,27 @@
+# Oracle → SQL Server 同步示例
+# 注意：Oracle 源端（Reader）与 SQL Server 目标端（Writer）均已内置支持，
+# 无需新增任何代码，直接配置即可。
+source:
+  dialect: oracle
+  host: 127.0.0.1
+  port: 1521
+  username: source_user
+  password: orapass
+  service: orcl
+  conn_type: service
+
+target:
+  dialect: sqlserver
+  host: 127.0.0.1
+  port: 1433
+  username: sa
+  password: sqlpass
+  database: dstdb
+  # encrypt: "true"        # 连 Azure SQL 或强制加密实例时启用
+
+tables:
+  - name: ORDERS
+    mode: full
+  - name: USERS
+    mode: incremental
+    watermark: ID

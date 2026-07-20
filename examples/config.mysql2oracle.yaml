@@ -1,0 +1,61 @@
+# godbsync 示例配置：MySQL -> Oracle 同步
+# 复制本文件为 config.yaml 并按实际环境修改。
+# 本示例演示反向同步（MySQL 作为源端，Oracle 作为目标端）。
+
+# ===== 源库（MySQL）=====
+source:
+  dialect: mysql            # 源数据库类型：mysql / oracle
+  host: 10.0.0.21          # 主机地址
+  port: 3306               # 监听端口（默认 3306）
+  username: sync           # 用户名
+  password: sync_pass      # 密码
+  database: sync_src       # 源数据库名（dialect=mysql 时必填）
+  charset: utf8mb4
+  timezone: UTC             # 时间列读取时区（默认 UTC）
+
+# ===== 目标库（Oracle）=====
+target:
+  dialect: oracle           # 目标数据库类型：oracle / mysql
+  host: 10.0.0.11          # 主机地址
+  port: 1521               # 监听端口（默认 1521）
+  username: hr             # 用户名（目标表默认建在该用户 schema 下）
+  password: hr_pass        # 密码
+  service: ORCLPDB1        # 服务名或 SID（dialect=oracle 时必填）
+  conn_type: service       # service=使用服务名（默认）; sid=使用 SID
+  # schema: HR             # 可选：目标表统一属主；若省略则建在 username 对应的 schema 下。
+                           # 单表可用 tables[].target: "OWNER.TABLE" 形式指定属主。
+
+# ===== 进度存储（水位表/断点表存放位置）=====
+# 目标库为 Oracle 时，进度后端默认用 sqlite（本地文件，零依赖）。
+# 若想让进度存进 MySQL（集中管理、与运行环境解耦），可改用「独立进度 MySQL」——
+# 见 config.mysql2oracle.statemysql.yaml（在 state.mysql 段配置任意 MySQL 即可，
+# 不再要求目标库本身是 MySQL）。
+state:
+  backend: sqlite
+  path: godbsync.db
+
+# ===== 全局选项 =====
+workers: 4
+log_level: info
+auto_validate: true
+validate_sample_size: 100
+
+# ===== 待同步表 =====
+tables:
+  # 全量同步示例：每次先清空目标表再全量写入（配置 truncate: true）
+  - name: employees        # MySQL 源表名
+    target: EMPLOYEES      # Oracle 目标表名（可选，省略则与 name 相同，按大写创建）
+    mode: full
+    truncate: true         # 写入前清空目标表
+    batch_size: 2000
+    # column_mapping:      # MySQL列名->Oracle列名的映射（仅需名称不同的列）
+    #   emp_id: EMP_ID
+    #   first_name: FIRST_NAME
+
+  # 增量同步示例：基于水位列 updated_at 持续推进
+  - name: orders
+    target: ORDERS
+    mode: incremental
+    watermark: updated_at  # 单调列（时间戳或自增主键）
+    batch_size: 1000
+    ignore_errors: false
