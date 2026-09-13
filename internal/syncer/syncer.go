@@ -3,6 +3,7 @@ package syncer
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,10 @@ type Syncer struct {
 	writer   dialect.Writer
 	state    state.Backend
 	log      *logrus.Entry
+
+	// expandedTables 是通配符 * 展开后的真实表列表；expanded 标记是否已展开（幂等）。
+	expanded       bool
+	expandedTables []config.TableConfig
 }
 
 // New 创建 Syncer 并完成连接池配置。
@@ -53,6 +58,9 @@ func (s *Syncer) InitSchema(filter []string) error {
 		return err
 	}
 	if err := s.state.EnsureCheckpointTable(); err != nil {
+		return err
+	}
+	if err := s.state.EnsureWrittenRowsTable(); err != nil {
 		return err
 	}
 	for _, t := range s.filterTables(filter) {
@@ -157,16 +165,109 @@ func (s *Syncer) Tables(filter []string) []config.TableConfig {
 	return s.filterTables(filter)
 }
 
+// Expand 将配置中的通配符表（name == "*"）展开为源库真实表列表。
+// 必须在源连接已建立后调用；幂等。展开后的真实表继承通配符条目的同步选项（mode/truncate/batch_size 等），
+// 目标表名与源表同名，并清空表级 schema（整库级已通过 sourceNamespace 定位，避免重复限定）。
+func (s *Syncer) Expand() error {
+	if s.expanded {
+		return nil
+	}
+	schema := s.sourceNamespace(config.TableConfig{})
+	out := make([]config.TableConfig, 0, len(s.cfg.Tables))
+	for _, t := range s.cfg.Tables {
+		if t.Name != "*" {
+			out = append(out, t)
+			continue
+		}
+		names, err := s.reader.ListTables(s.sourceDB, schema)
+		if err != nil {
+			return fmt.Errorf("展开通配符 * 失败: %w", err)
+		}
+		s.log.Infof("通配符 * 在 %s 匹配到 %d 张表", schema, len(names))
+		for _, name := range names {
+			nt := t
+			nt.Name = name
+			nt.Target = name
+			nt.Schema = ""
+			out = append(out, nt)
+		}
+	}
+	s.expandedTables = out
+	s.expanded = true
+	return nil
+}
+
+// PreSyncStructureCheck 整库同步（通配符 * 展开）前的结构预检。
+// 仅当已展开（s.expanded，即配置含 name: "*"）时生效；对每张「已存在于目标库」的表，
+// 读取源列并与目标表现有列比对，由 Writer.GenerateAlter 生成差异 DDL。
+// 发现任意结构不一致即返回错误（错误信息内含每张表的完整变更 SQL），调用方据此退出；
+// 此时尚未执行任何 truncate / 写入，目标库保持原状（即「还原」语义）。
+// 目标表不存在的表跳过（将由后续建表流程新建，无需比对）。
+func (s *Syncer) PreSyncStructureCheck(filter []string) error {
+	if !s.expanded {
+		return nil
+	}
+	var diffs []string
+	for _, t := range s.filterTables(filter) {
+		target := t.TargetName()
+		exists, err := s.writer.TableExists(s.targetDB, s.cfg.Target.Database, target)
+		if err != nil {
+			return fmt.Errorf("结构预检：检查目标表 %s 是否存在失败: %w", target, err)
+		}
+		if !exists {
+			continue // 目标表不存在，将新建，无需比对
+		}
+		srcRef := t.SourceRef(s.cfg.Source.Schema)
+		cols, err := s.reader.TableColumns(s.sourceDB, srcRef)
+		if err != nil {
+			return fmt.Errorf("结构预检：读取源表 %s 列失败: %w", srcRef, err)
+		}
+		mapped := make([]types.Column, len(cols))
+		for i, c := range cols {
+			mapped[i] = c
+			mapped[i].Name = t.TargetColName(c.Name)
+		}
+		alter, err := s.writer.GenerateAlter(s.targetDB, target, mapped)
+		if err != nil {
+			return fmt.Errorf("结构预检：生成表 %s 变更SQL失败: %w", target, err)
+		}
+		if alter != "" {
+			diffs = append(diffs, fmt.Sprintf("-- 表 %s 结构不一致，需先执行以下 DDL 再重跑（目标库保持原状）：\n%s", target, alter))
+		}
+	}
+	if len(diffs) > 0 {
+		// 关键：不要用 logrus 的 msg 字段承载多行 DDL——logrus 文本格式器在消息含空格时会
+		// 加引号并把真实换行转义成字面 "\n"（appendEscaped），导致 DDL 显示成一行、无法复制。
+		// 因此改用原始多行输出（真实换行）并同时落盘 .sql 文件，保证可读、可直接执行。
+		block := strings.Join(diffs, "\n\n")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "==================================================================")
+		fmt.Fprintln(os.Stderr, "检测到以下表目标结构与源不一致，已生成变更SQL并终止同步（目标库未做任何改动）：")
+		fmt.Fprintln(os.Stderr, "==================================================================")
+		fmt.Fprintln(os.Stderr, block)
+		sqlFile := "godbsync_alter.sql"
+		if err := os.WriteFile(sqlFile, []byte(block+"\n"), 0644); err == nil {
+			fmt.Fprintf(os.Stderr, "\n变更SQL已写入 %s（可直接执行后再重跑 full）\n", sqlFile)
+		}
+		return fmt.Errorf("检测到 %d 张表目标结构与源不一致，已生成变更SQL并终止同步（目标库未做任何改动，详见上方输出或 godbsync_alter.sql）", len(diffs))
+	}
+	return nil
+}
+
 func (s *Syncer) filterTables(filter []string) []config.TableConfig {
+	base := s.cfg.Tables
+	if s.expanded {
+		base = s.expandedTables
+	}
 	if len(filter) == 0 {
-		return s.cfg.Tables
+		return base
 	}
 	set := make(map[string]bool, len(filter))
 	for _, f := range filter {
 		set[strings.ToUpper(f)] = true
 	}
 	var out []config.TableConfig
-	for _, t := range s.cfg.Tables {
+	for _, t := range base {
 		if set[strings.ToUpper(t.Name)] || set[strings.ToUpper(t.TargetName())] {
 			out = append(out, t)
 		}

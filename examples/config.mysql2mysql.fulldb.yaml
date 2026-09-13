@@ -1,0 +1,85 @@
+# godbsync 示例配置：MySQL 整库 → MySQL 全量同步（通配符 *）
+# 复制本文件为 config.yaml 并按实际环境修改。
+#
+# 适用场景：把 source.database 整个库的**所有基表**一次性镜像到 target.database，
+# 目标表与源表同名，无需逐张表声明（视图与系统库表由 ListTables 自动排除）。
+#
+# 典型用法：
+#   godbsync init     -config config.yaml              # 目标表不存在时自动建表
+#   godbsync full     -config config.yaml              # 整库全量（支持断点续传）
+#   godbsync full     -config config.yaml -fresh       # 清除断点、重新做一次全量
+#   godbsync full     -config config.yaml -table orders  # 只跑展开后的某一张表
+#   godbsync validate -config config.yaml              # 行数比对 + 主键抽样内容校验
+#
+# 注意事项：
+#   1) 通配符 * 仅支持 full 模式（增量需逐表指定 watermark）；target 须省略或为 "*"（整库同名映射）。
+#   2) full 执行前会做整库结构预检：目标表缺列或列类型与源不一致时，工具打印对应的 ALTER TABLE
+#      并直接退出——不 truncate、不写入，目标库保持原状；先执行提示的 DDL 再重跑即可。
+#   3) monitor / checkpoint 只读配置与进度后端，不连源库枚举，配置里写 "*" 时只显示模板条目；
+#      已同步的真实表名记录在进度后端。
+
+# ===== 源库（MySQL，整库同步的作用域）=====
+source:
+  dialect: mysql            # 源数据库类型
+  host: 10.0.0.21          # 主机地址
+  port: 3306               # 监听端口（默认 3306）
+  username: sync           # 用户名（需有源库 SELECT + INFORMATION_SCHEMA 读权限）
+  password: sync_pass      # 密码
+  database: app_src        # 必填：源库名；通配符 * 就在这个库里枚举所有基表
+  charset: utf8mb4
+  timezone: UTC             # 时间列读取时区（默认 UTC）
+
+# ===== 目标库（MySQL）=====
+target:
+  dialect: mysql
+  host: 10.0.0.22
+  port: 3306
+  username: sync
+  password: sync_pass
+  database: app_dst        # 必填：目标库名，需提前 CREATE DATABASE（工具只建表、不建库）
+  charset: utf8mb4
+  timezone: UTC
+
+# ===== 进度存储（水位表/断点表存放位置）=====
+# 整库表数量多、跑时长，建议把进度放到「独立 MySQL」，便于集中查看与断点续传。
+state:
+  backend: mysql
+  mysql:
+    host: 10.0.0.99            # 独立进度库地址（任意 MySQL，不必是同步目标库）
+    port: 3306
+    username: godbsync
+    password: godbsync_pass
+    database: godbsync_state   # 进度表 godbsync_watermark / godbsync_checkpoint 建在该库
+    charset: utf8mb4
+    timezone: UTC
+# 想更省事可整段换成 SQLite（本地文件、零依赖，但多实例并发勿用）：
+#   state:
+#     backend: sqlite
+#     path: godbsync.db
+# 目标端就是 MySQL 时，也可只写 backend: mysql 而不配 state.mysql，回退复用目标库连接。
+
+# ===== 全局选项 =====
+workers: 4                 # 单表写入并发 worker 数
+batch_size: 2000           # 全局每批写入行数（表级 tables[].batch_size 优先）
+log_level: info            # debug / info / warn / error
+auto_validate: true        # 同步完成后自动校验两侧行数
+validate_sample_size: 100   # 内容校验按主键抽样的行数（大表可调小）
+# validate_sample_random: true      # 抽样起点随机，避免总抽到小主键区间
+# watermark_checkpoint_interval: 10 # 断点/水位周期持久化间隔（秒，默认 10）
+
+# ===== 待同步表 =====
+tables:
+  # 通配符整库：展开为源库全部基表，目标同名，继承下面的 mode/truncate/batch_size
+  - name: "*"
+    # target: "*"          # 整库同名映射，省略等价（不允许改名）
+    mode: full             # 通配符仅支持 full
+    truncate: true         # 写入前清空目标表（整库镜像场景常用）
+    batch_size: 2000
+    ignore_errors: false   # 单批失败即终止；设为 true 则跳过失败批次继续
+
+  # 若个别表想走增量，可在 "*" 之外单独声明（mode: incremental + watermark 必填）。
+  # 注意：该表若同时被 "*" 命中会各跑一次，重复声明前先确认是否需要。
+  # - name: orders
+  #   mode: incremental
+  #   watermark: updated_at    # 单调列（时间戳或自增主键）
+  #   batch_size: 1000

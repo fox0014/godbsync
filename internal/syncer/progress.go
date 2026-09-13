@@ -115,6 +115,9 @@ func (t *progressTracker) percent() float64 {
 	return p
 }
 
+// Total 返回源端总行数（由 queryTotal 在同步开始时记录），供写入 state 后端作为进度分母。
+func (t *progressTracker) Total() int64 { return t.total }
+
 // Status 返回当前进度快照。
 func (t *progressTracker) Status() (done, total int64, percent float64, eta time.Duration, speed float64) {
 	t.mu.Lock()

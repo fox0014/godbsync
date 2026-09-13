@@ -19,6 +19,8 @@ type Backend interface {
 	EnsureWatermarkTable() error
 	// EnsureCheckpointTable 创建（若不存在）全量断点表。
 	EnsureCheckpointTable() error
+	// EnsureWrittenRowsTable 创建（若不存在）已写入行数表。
+	EnsureWrittenRowsTable() error
 
 	// GetWatermark 读取表的水位值；found=false 表示尚未同步过。
 	GetWatermark(table string) (value string, found bool, err error)
@@ -35,6 +37,17 @@ type Backend interface {
 	ListCheckpoints() ([]CheckpointRow, error)
 	// ClearAllCheckpoints 删除全部表的断点记录。
 	ClearAllCheckpoints() error
+
+	// GetWrittenRows 读取表的全量同步已写入行数（由 syncer 周期性刷新）；
+	// found=false 表示尚未写入或已被清除（同步未开始/已结束）。
+	GetWrittenRows(table string) (count int64, found bool, err error)
+	// GetSourceTotal 读取表的源端总行数（由 syncer 在同步开始时记录一次，供 monitor 计算进度分母）；
+	// found=false 表示尚未记录。
+	GetSourceTotal(table string) (total int64, found bool, err error)
+	// SetWrittenRows 写入/更新表的源端总行数与已写入行数（sourceTotal 同步开始记一次，written 周期刷新）。
+	SetWrittenRows(table string, sourceTotal, written int64) error
+	// ClearWrittenRows 清除表的已写入行数记录（全量结束时调用）。
+	ClearWrittenRows(table string) error
 
 	// Close 释放后端持有资源（MySQL 后端由调用方管理连接，此处为空操作）。
 	Close() error

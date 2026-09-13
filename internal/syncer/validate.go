@@ -192,16 +192,11 @@ func (s *Syncer) validateContent(t config.TableConfig, srcRef, target string, pk
 		return 0, nil
 	}
 
-	// 抽样主键：按主键排序，取排序后第 offset+1 .. end 行（ROW_NUMBER 兼容 10g+）。
-	// 源端主键列名按源方言引用，表引用直接使用 SourceRef。
-	orderCols := make([]string, len(pk))
-	for i, k := range pk {
-		orderCols[i] = s.reader.QuoteIdentifier(k)
-	}
-	orderBy := strings.Join(orderCols, ", ")
-	sampleQ := fmt.Sprintf(
-		"SELECT %s FROM (SELECT %s, ROW_NUMBER() OVER (ORDER BY %s) AS RN FROM %s) sub WHERE RN > %d AND RN <= %d",
-		strings.Join(orderCols, ", "), strings.Join(orderCols, ", "), orderBy, srcRef, offset, end)
+	// 抽样主键：按主键排序，取排序后第 offset+1 .. end 行。
+	// 分页语法由源方言自行实现（MySQL/PostgreSQL 用 LIMIT/OFFSET、Oracle 用 ROWNUM、
+	// SQL Server 用 ROW_NUMBER），syncer 不硬编码窗口函数，
+	// 从而兼容 MySQL 5.7 等不支持 ROW_NUMBER() OVER 的老版本数据库。
+	sampleQ := s.reader.SamplePKQuery(srcRef, pk, offset, end-offset)
 	keys, err := s.samplePrimaryKeys(sampleQ)
 	if err != nil {
 		return 0, fmt.Errorf("抽样主键失败: %w", err)

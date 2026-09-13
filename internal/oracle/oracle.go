@@ -69,6 +69,21 @@ func (r *Reader) QuoteIdentifier(name string) string {
 	return `"` + name + `"`
 }
 
+// SamplePKQuery 按主键有序抽样：Oracle 用 ROWNUM 伪列分页。
+// 必须三层嵌套：最内层 ORDER BY 排序，中层在已排序结果上分配 ROWNUM 并截断上界，最外层按下界过滤。
+// 若把 ORDER BY 与 ROWNUM 写在同一层，ROWNUM 会在排序之前分配，导致取到错乱的区间。
+// ROWNUM 兼容 9i/10g/11g（OFFSET/FETCH 需 12c+），覆盖面更广。
+func (r *Reader) SamplePKQuery(tableRef string, orderCols []string, offset, limit int64) string {
+	cols := make([]string, len(orderCols))
+	for i, c := range orderCols {
+		cols[i] = r.QuoteIdentifier(c)
+	}
+	sel := strings.Join(cols, ", ")
+	return fmt.Sprintf(
+		"SELECT %s FROM (SELECT %s, ROWNUM AS RN FROM (SELECT %s FROM %s ORDER BY %s) WHERE ROWNUM <= %d) WHERE RN > %d",
+		sel, sel, sel, tableRef, sel, offset+limit, offset)
+}
+
 func (r *Reader) SupportsRowID() bool { return true }
 
 func (r *Reader) Normalize(v interface{}, dbType string) interface{} { return normalize(v) }
@@ -76,6 +91,33 @@ func (r *Reader) Normalize(v interface{}, dbType string) interface{} { return no
 func (r *Reader) IsTimeType(dbType string) bool { return isTimeType(dbType) }
 
 func (r *Reader) IsNumericType(dbType string) bool { return isNumericType(dbType) }
+
+// ListTables 枚举 Oracle 源库（owner）下所有表，用于通配符 * 整库同步展开。
+// owner 为空时枚举当前用户拥有的表（user_tables），否则按 all_tables 属主过滤。
+func (r *Reader) ListTables(db *sql.DB, schema string) ([]string, error) {
+	var q string
+	var args []interface{}
+	if schema == "" {
+		q = `SELECT table_name FROM user_tables ORDER BY table_name`
+	} else {
+		q = `SELECT table_name FROM all_tables WHERE UPPER(owner) = UPPER(:1) ORDER BY table_name`
+		args = []interface{}{schema}
+	}
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("枚举 Oracle 源库表失败: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
 
 // Open 打开一个 Oracle 连接。
 // go-ora 是纯 Go 实现的 Oracle 驱动，无需安装 Oracle 客户端。
@@ -427,6 +469,54 @@ func oracleGenerateCreate(db *sql.DB, table string, cols []types.Column, pk []st
 	}
 	body := strings.Join(defs, ",\n")
 	return fmt.Sprintf("CREATE TABLE \"%s\" (\n%s\n)", tableName, body), nil
+}
+
+// GenerateAlter 比对目标表（已存在）现有列与映射后的源列，生成使其一致的 ALTER TABLE 语句。
+// 仅处理「目标缺列（ADD）」与「列类型不一致（MODIFY）」两类差异；
+// 目标多出而源没有的列不参与（避免误删业务列）。只读目标库、不执行 DDL。
+// 返回空字符串表示结构一致。供整库同步前结构预检：发现不一致由调用方打印并退出。
+func (w *Writer) GenerateAlter(db *sql.DB, table string, srcCols []types.Column) (string, error) {
+	tgtCols, err := TableColumns(db, table)
+	if err != nil {
+		return "", fmt.Errorf("读取目标表 %s 现有列失败: %w", table, err)
+	}
+	ver := detectOracleVersion(db)
+	tgtMap := make(map[string]types.Column, len(tgtCols))
+	for _, c := range tgtCols {
+		tgtMap[strings.ToUpper(c.Name)] = c
+	}
+	qT := w.QuoteIdentifier(table)
+	var stmts []string
+	for _, sc := range srcCols {
+		want, e := oracleType(sc, ver)
+		if e != nil {
+			return "", e
+		}
+		qC := w.QuoteIdentifier(sc.Name)
+		tc, ok := tgtMap[strings.ToUpper(sc.Name)]
+		if !ok {
+			line := fmt.Sprintf("ALTER TABLE %s ADD (%s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			line += ")"
+			stmts = append(stmts, line+";")
+			continue
+		}
+		have, e := oracleType(tc, ver)
+		if e != nil {
+			have = ""
+		}
+		if have != want {
+			line := fmt.Sprintf("ALTER TABLE %s MODIFY (%s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			line += ")"
+			stmts = append(stmts, line+";")
+		}
+	}
+	return strings.Join(stmts, "\n"), nil
 }
 
 // oracleType 将源数据库列类型（典型为 MySQL 类型名）映射为 Oracle 列类型定义。

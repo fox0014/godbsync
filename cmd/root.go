@@ -47,11 +47,13 @@ func Execute() int {
 	clear := fs.Bool("clear", false, "checkpoint 模式：清除断点（需配合 -table 或 -all）")
 	all := fs.Bool("all", false, "checkpoint -clear 模式：清除全部表断点（不与 -table 共用）")
 	stateFlag := fs.String("state", "", "进度存储后端（覆盖配置文件 state 段）：file[=/path/db]（SQLite 本地文件）或 mysql（存入独立进度库，见 state.mysql 段）")
-	watch := fs.Duration("watch", 0, "status 模式：每隔 N 持续刷新（如 2s）")
-	quick := fs.Bool("quick", false, "status / monitor 模式：只显示断点/水位，不实时统计源/目标行数")
-	noScroll := fs.Bool("scroll", false, "status --watch 模式：翻滚输出（向下追加）；默认原地覆盖刷新（清屏重绘），仅终端有效")
+	watch := fs.Duration("watch", 0, "monitor -cli 模式：每隔 N 持续刷新（如 2s）")
+	quick := fs.Bool("quick", false, "monitor 模式：只显示断点/水位，不实时统计源/目标行数")
+	verify := fs.Bool("verify", false, "monitor 模式：额外执行实时 COUNT(*) 做一致性校验（默认仅读进度后端，不查业务库）")
+	noScroll := fs.Bool("scroll", false, "monitor -cli --watch 模式：翻滚输出（向下追加）；默认原地覆盖刷新（清屏重绘），仅终端有效")
 	addr := fs.String("addr", ":8080", "monitor 模式：HTTP 监听地址（如 :8080 或 127.0.0.1:9000）")
 	refresh := fs.Duration("refresh", 2*time.Second, "monitor 模式：前端自动刷新间隔（如 2s）")
+	cli := fs.Bool("cli", false, "monitor 模式：终端报告（等同原 status 子命令）")
 	_ = fs.Parse(args[1:])
 
 	if cmdName == "version" || cmdName == "-v" || cmdName == "--version" {
@@ -62,6 +64,17 @@ func Execute() int {
 	if cmdName == "help" || cmdName == "-h" || cmdName == "--help" {
 		printUsage()
 		return 0
+	}
+
+	// 已知命令白名单：未知命令（含已移除的 status）立即打印用法并退出，
+	// 避免落到下方「其余命令」分支误开源/目标业务库连接。
+	known := map[string]bool{
+		"checkpoint": true, "monitor": true, "init": true, "full": true,
+		"incr": true, "daemon": true, "validate": true,
+	}
+	if !known[cmdName] {
+		printUsage()
+		return 2
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -97,39 +110,9 @@ func Execute() int {
 		return runCheckpoint(st, cfg, parseFilter(*tableFlag), *clear, *all, log)
 	}
 
-	// status 子命令：读取进度后端（断点/水位）+ 实时源/目标行数，展示各表同步状态。
-	// quick=false 时需要源端 + 目标端双连接以做一致性统计；quick=true 仅读进度后端。
-	if cmdName == "status" {
-		st, extra, e := openStateBackend(cfg, stateKind, statePath, nil)
-		if e != nil {
-			log.Errorf("%v", e)
-			return 1
-		}
-		if extra != nil {
-			defer extra.Close()
-		}
-		defer st.Close()
-
-		var odb, mdb *sql.DB
-		if !*quick {
-			odb, e = openSourceDB(cfg.Source)
-			if e != nil {
-				log.Errorf("源库 %s 连接失败: %v", cfg.Source.Dialect, e)
-				return 1
-			}
-			defer odb.Close()
-			mdb, e = openTargetDB(cfg.Target)
-			if e != nil {
-				log.Errorf("目标库 %s 连接失败: %v", cfg.Target.Dialect, e)
-				return 1
-			}
-			defer mdb.Close()
-		}
-		return runStatus(cfg, st, odb, mdb, *quick, *watch, *noScroll, log, parseFilter(*tableFlag))
-	}
-
-	// monitor 子命令：启动内嵌 HTTP 服务，浏览器查看可视化同步状态。
-	// 与 status 类似——只读进度后端（+ 非 quick 时的源/目标实时行数）；
+	// monitor 子命令：查看同步状态，两种形态：
+	//   -cli      终端报告（等同原 status 子命令）：默认仅读进度后端；--verify 时连业务库做实时 COUNT(*) 校验；--watch N 实时刷新。
+	//   -web/默认  启动内嵌 HTTP 服务，浏览器可视化监控（http://:8080/）；默认纯后端驱动，?verify=1 或 --verify 时懒连接校验。
 	// 与 daemon 解耦，可分别运行于不同进程（daemon 写进度，monitor 读进度）。
 	if cmdName == "monitor" {
 		st, extra, e := openStateBackend(cfg, stateKind, statePath, nil)
@@ -142,22 +125,26 @@ func Execute() int {
 		}
 		defer st.Close()
 
-		var odb, mdb *sql.DB
-		if !*quick {
-			odb, e = openSourceDB(cfg.Source)
-			if e != nil {
-				log.Errorf("源库 %s 连接失败: %v", cfg.Source.Dialect, e)
-				return 1
+		live := *verify && !*quick
+		if *cli {
+			var odb, mdb *sql.DB
+			if live {
+				odb, e = openSourceDB(cfg.Source)
+				if e != nil {
+					log.Errorf("源库 %s 连接失败: %v", cfg.Source.Dialect, e)
+					return 1
+				}
+				defer odb.Close()
+				mdb, e = openTargetDB(cfg.Target)
+				if e != nil {
+					log.Errorf("目标库 %s 连接失败: %v", cfg.Target.Dialect, e)
+					return 1
+				}
+				defer mdb.Close()
 			}
-			defer odb.Close()
-			mdb, e = openTargetDB(cfg.Target)
-			if e != nil {
-				log.Errorf("目标库 %s 连接失败: %v", cfg.Target.Dialect, e)
-				return 1
-			}
-			defer mdb.Close()
+			return runStatus(cfg, st, odb, mdb, live, *watch, *noScroll, log, parseFilter(*tableFlag))
 		}
-		return runMonitor(cfg, st, odb, mdb, *quick, *addr, *refresh, parseFilter(*tableFlag), log)
+		return runMonitor(cfg, st, live, *addr, *refresh, parseFilter(*tableFlag), log)
 	}
 
 	// 其余命令需要源端 + 目标端双连接。
@@ -216,6 +203,12 @@ func Execute() int {
 
 	filter := parseFilter(*tableFlag)
 
+	// 展开通配符表（name == "*"）→ 源库真实表列表；monitor/status 只读进度后端不依赖此。
+	if err := s.Expand(); err != nil {
+		log.Errorf("展开通配符表失败: %v", err)
+		return 1
+	}
+
 	switch cmdName {
 	case "init":
 		if err := s.InitSchema(filter); err != nil {
@@ -224,18 +217,37 @@ func Execute() int {
 		}
 		log.Infof("init 完成")
 	case "full":
-		for _, t := range s.Tables(filter) {
+		// 整库同步（通配符 *）结构预检：任意目标表结构不一致时打印变更SQL并退出，
+		// 不执行 truncate/写入，目标库保持原状（还原语义）。该预检保持 fail-fast。
+		if err := s.PreSyncStructureCheck(filter); err != nil {
+			log.Errorf("%v", err)
+			return 1
+		}
+		// 表级同步改为容错继续：单表失败不阻断整库，结尾统一汇总成功/失败表数与失败表清单。
+		// 已成功的表数据保留（幂等 upsert + 断点），失败表可用 -table 过滤针对性重跑。
+		tables := s.Tables(filter)
+		var failedTables []string
+		for _, t := range tables {
 			boundary, err := s.FullSync(t, *fresh)
 			if err != nil {
 				log.Errorf("全量同步 %s 失败: %v", t.Name, err)
-				return 1
+				failedTables = append(failedTables, t.Name)
+				continue
 			}
 			if cfg.ResolveAutoValidate() {
 				if err := s.Validate(t, boundary); err != nil {
 					log.Errorf("校验 %s 失败: %v", t.Name, err)
-					return 1
+					failedTables = append(failedTables, t.Name)
+					continue
 				}
 			}
+		}
+		ok := len(tables) - len(failedTables)
+		log.Infof("整库全量同步完成：共 %d 张表，成功 %d，失败 %d",
+			len(tables), ok, len(failedTables))
+		if len(failedTables) > 0 {
+			log.Errorf("失败表：%s", strings.Join(failedTables, ", "))
+			return 1
 		}
 	case "incr":
 		for _, t := range s.Tables(filter) {
@@ -574,8 +586,7 @@ func printUsage() {
   incr      增量同步（基于水位列推进）
   daemon    以固定间隔循环执行增量同步
   validate  对比源端与目标端两侧行数
-  status    展示各表同步状态（断点/水位 + 源目标行数一致性）
-  monitor   启动内嵌 Web 服务，浏览器可视化监控同步状态（http://:8080/）
+  monitor   查看同步状态：终端报告（-cli）或启动内嵌 Web 服务（-web/默认，http://:8080/）
   checkpoint 查看或清除全量断点（godbsync_checkpoint）
   version   打印版本号
 
@@ -599,12 +610,14 @@ func printUsage() {
   godbsync checkpoint -table EMPLOYEES                   # 查看单表断点
   godbsync checkpoint -clear -table EMPLOYEES            # 清除单表断点
   godbsync checkpoint -clear -all                        # 清除全部断点
-  godbsync status -config config.yaml                    # 展示各表同步状态（含源/目标行数一致性）
-  godbsync status -config config.yaml --watch 2s        # 每 2s 刷新（默认原地覆盖，清屏重绘）
-  godbsync status -config config.yaml --watch 2s --scroll    # 改为翻滚输出（向下追加）
-  godbsync status -config config.yaml --quick           # 仅读断点/水位，不统计行数
-  godbsync monitor -config config.yaml                   # 启动 Web 监控（默认 :8080，浏览器打开）
+  godbsync monitor -cli -config config.yaml                    # 终端展示各表同步状态（默认仅读进度后端，不查业务库）
+  godbsync monitor -cli -config config.yaml --verify           # 额外实时 COUNT(*) 做一致性校验
+  godbsync monitor -cli -config config.yaml --watch 2s        # 每 2s 刷新（默认原地覆盖，清屏重绘）
+  godbsync monitor -cli -config config.yaml --watch 2s --scroll    # 改为翻滚输出（向下追加）
+  godbsync monitor -cli -config config.yaml --quick           # 仅读断点/水位，不统计行数
+  godbsync monitor -config config.yaml                        # 启动 Web 监控（默认 :8080，仅读进度后端，不查业务库）
   godbsync monitor -config config.yaml -addr 127.0.0.1:9000 -refresh 5s   # 指定地址与刷新间隔
+  godbsync monitor -config config.yaml --verify          # 启动即连接业务库做实时一致性校验
   godbsync monitor -config config.yaml --quick           # 仅断点/水位，不连库统计行数
   # CLI 覆盖配置文件 state 段（临时切换后端）：
   #   -state mysql 需要配置文件中已填 state.mysql 段（独立进度库），或目标库本身为 MySQL

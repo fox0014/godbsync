@@ -9,17 +9,19 @@
 go build -ldflags="-s -w" -o godbsync.exe .
 go test ./... / go vet ./... / gofmt -l .
 ```
-子命令：`init` / `full` / `incr` / `daemon` / `validate` / `status` / `monitor` / `checkpoint` / `version`。
+子命令：`init` / `full` / `incr` / `daemon` / `validate` / `monitor` / `checkpoint` / `version`。
 
-- `status`：只读展示各表同步状态。读取进度后端（断点 anchor / 增量水位）作为「最后同步位置」；
-  非 `--quick` 时额外实时统计源/目标行数做一致性校验（需源+目标双连接），状态判定
-  `OK`（一致）/`DIVERGED`（不一致）/`SYNCED`（有断点/水位但未实时比对）/`PENDING`（从未同步）。
-  支持 `--watch N`（每 N 间隔刷新）与 `--quick`（仅读进度后端、不连库）。
-- `monitor`：启动内嵌 HTTP 服务，浏览器可视化监控同步状态（默认 `:8080`）。
-  纯 Go `net/http` + 内嵌 HTML（无 CDN，适配内网/离线）；与 `daemon` 解耦（monitor 只读进度后端，daemon 写）。
-  新增 `cmd/monitor.go`（`runMonitor` + `/api/status` JSON + `collectOverview`，复用 `computeStatusRow`）；
-  内嵌面板 `cmd/web/monitor.html`（浅色主题、自动轮询、状态徽章/进度条、刷新频率切换、连接失败提示）。
-  标志：`-addr`（默认 `:8080`）、`-refresh`（前端刷新间隔，默认 `2s`）、`--quick`、`-table`；`Ctrl+C` 优雅关闭。
+- `monitor`：查看同步状态，两种形态（底层共用 `computeStatusRow`）：
+  - `monitor -cli`：终端报告（等同原 `status` 子命令）。只读展示各表同步状态：读取进度后端（断点 anchor / 增量水位）作为「最后同步位置」；
+    非 `--quick` 时额外实时统计源/目标行数做一致性校验（需源+目标双连接），状态判定
+    `OK`（一致）/`DIVERGED`（不一致）/`SYNCED`（有断点/水位但未实时比对）/`PENDING`（从未同步）。
+    支持 `--watch N`（每 N 间隔刷新）与 `--quick`（仅读进度后端、不连库）。
+  - `monitor`（或 `monitor -web`）：启动内嵌 HTTP 服务，浏览器可视化监控同步状态（默认 `:8080`）。
+    纯 Go `net/http` + 内嵌 HTML（无 CDN，适配内网/离线）；与 `daemon` 解耦（monitor 只读进度后端，daemon 写）。
+    新增 `cmd/monitor.go`（`runMonitor` + `/api/status` JSON + `collectOverview`，复用 `computeStatusRow`）；
+    内嵌面板 `cmd/web/monitor.html`（浅色主题、自动轮询、状态徽章/进度条、刷新频率切换、连接失败提示）。
+    标志：`-addr`（默认 `:8080`）、`-refresh`（前端刷新间隔，默认 `2s`）、`--quick`、`-table`；`Ctrl+C` 优雅关闭。
+    > 注：原独立 `status` 子命令已合并进 `monitor -cli`，命令移除。
 
 ## 架构（依赖倒置，方向无关）
 `cmd`（组合根，按方言名实例化） → `syncer`（唯一编排，方向无关） →
@@ -35,8 +37,8 @@ go test ./... / go vet ./... / gofmt -l .
 
 ### dialect 接口职责
 `Reader`（源）：`Open` / `TableColumns` / `PrimaryKey` / `RowCount` / `ScanRow` /
-`Placeholder`（oracle `:n`、mysql/sqlserver `?`、postgresql `$n`）/ `QuoteIdentifier`（oracle `"x"`、mysql `` `x` ``、sqlserver `[x]`、postgresql `"x"`）/
-`SupportsRowID`（仅 oracle=true，mysql/sqlserver=false）/ `Normalize` / `IsTimeType` / `IsNumericType`。
+`Placeholder`（oracle `:n`、mysql `?`、sqlserver `@pn`、postgresql `$n`）/ `QuoteIdentifier`（oracle `"x"`、mysql `` `x` ``、sqlserver `[x]`、postgresql `"x"`）/
+`SupportsRowID`（仅 oracle=true，mysql/sqlserver=false）/ `Normalize` / `IsTimeType` / `IsNumericType` / `ListTables`（枚举源库基表，供通配符 * 整库展开）。
 `Writer`（目标）：`Open` / `BulkUpsert` / `Truncate` / `TableExists` / `ExecDDL` /
 `GenerateCreate` / `RowCount` / `PrimaryKey` / `QuoteIdentifier` / `Placeholder`。
 
@@ -90,6 +92,13 @@ go test ./... / go vet ./... / gofmt -l .
 - 日志用 `logrus`；错误用 `fmt.Errorf %w` 中文包裹，由 `cmd` 返回退出码。
 - 表名/列名引用由方言 `QuoteIdentifier` 包裹；仅来自可信配置，**勿拼不可信输入**。
 - **标识符白名单校验**：`config.Validate()` 已对 source/target 的 `host`/`database`/`schema`/`service` 与每张表的 `name`/`target`/`schema`/`watermark`/`column_mapping` 做格式白名单（仅 `[A-Za-z0-9_]`、限定名允许单级 `.`、host 允许 `. : - _ / [ ]`），拒绝引号/空格/分号等注入字符。**这层校验使 godbsync 在不信任配置来源（用户上传/多租户）时也能防 SQL/DSN 注入**；空字段跳过。放宽白名单（如支持中文标识符）须改用 `QuoteIdentifier` 内部转义，而非删除校验。
+
+## 整库通配符同步
+- `tables[].name` 设为 `"*"` 表示匹配 `source` 指定库（MySQL 用 `database`、Oracle/SQL Server/PostgreSQL 用 `schema`，空时各自默认 `user_tables`/`dbo`/`public`）下的**所有基表**（自动排除视图与系统库表）。
+- 展开在 `syncer.Expand()` 中完成：遍历 `cfg.Tables`，遇 `name == "*"` 调用 `reader.ListTables` 枚举真实表名，生成同名、继承通配符条目 `mode`/`truncate`/`batch_size`/`ignore_errors` 的 `TableConfig`，再交给原有逐表流程（`init`/`full`/`incr`/`daemon`/`validate` 复用，编排零改动）。
+- 约束（`config.Validate()` 强制）：`target` 须省略或为 `"*"`（整库同名映射）；`mode` 仅允许 `full`（增量需逐表 `watermark`，故 `*` 不支持 `incremental`）；`name == "*"` 跳过标识符白名单校验，展开后的真实表名在 `ListTables` 中已保证合法。
+- 已知限制：`monitor` / `status` / `checkpoint` 子命令仅读配置或进度后端、不连源库枚举，配置里写 `"*"` 时它们只显示模板条目；实际已同步的真实表名记录在进度后端，后续可增强为从进度后端读取。
+- **整库结构预检（防误清空/数据损坏）**：`full` 命令在写入/清空前调用 `syncer.PreSyncStructureCheck()`（仅当已展开即 `name == "*"` 时生效）。它对每张「已存在于目标库」的表读取源列、调用 `Writer.GenerateAlter` 比对目标表现有列：发现**目标缺列**生成 `ADD COLUMN`、**列类型不一致**生成 `MODIFY`/`ALTER COLUMN`，目标多出而源没有的列不参与（不误删业务列）。任一表结构不一致即打印完整变更 SQL 并**退出（返回非 0），且不执行任何 truncate / 写入，目标库保持原状**（还原语义）；目标表不存在的表跳过（将新建，无需比对）。该预检只读目标库、不执行 DDL。`GenerateAlter` 已加入 `dialect.Writer` 接口，四个方言各自实现（复用各自 `readerTableColumns` 与类型映射函数，类型差异用同一条类型映射函数双向重建后比对，确保同义类型不被误报）。
 
 ## 扩展
 - 新数据库类型 → 新建包实现 `dialect.Reader` + `dialect.Writer`，在 `init()` 注册，

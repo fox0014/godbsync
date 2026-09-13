@@ -1,65 +1,50 @@
-# godbsync 配置文件（已脱敏模板，可安全提交/分享）
-# 本地真实配置请放在 config.local.yaml（已被 .gitignore 忽略）。
-# 运行本地真实配置：godbsync full -config config.local.yaml
-# 下面的 host / username / password / service / schema / database 均为占位符，请按实际环境替换。
+# godbsync 示例配置：MySQL -> SQL Server 同步
+# 复制本文件为 config.yaml 并按实际环境修改。
 
-# ===== 进度存储（水位表/断点表）=====
-state:
-  backend: sqlite          # sqlite（默认，本地文件）或 mysql（目标库）
-  path: godbsync.db        # SQLite 文件路径（仅 backend=sqlite 时生效）
-
-# ===== 源库 =====
+# ===== 源库（MySQL）=====
 source:
-  dialect: oracle            # 源数据库类型：oracle / mysql
-  host: your.oracle.host          # 主机地址（占位符，请替换）
-  port: 1521               # 监听端口（默认 1521）
-  username: your_source_user             # 用户名（占位符，请替换）
-  password: your_source_password        # 密码（占位符，请替换）
-  service: YOUR_SERVICE_NAME        # 服务名或 SID（dialect=oracle 时必填）
-  conn_type: service       # service=使用服务名（默认）; sid=使用 SID
-  schema: YOUR_SOURCE_SCHEMA     # 源表缺省属主（schema），表属于其他用户时必填，例如 CALIB_USER
-
-# ===== 目标库 =====
-target:
-  dialect: mysql            # 目标数据库类型：mysql / oracle
-  host: your.mysql.host
+  dialect: mysql
+  host: xxx
   port: 3306
-  database: your_target_db    # 目标数据库名（需提前创建，dialect=mysql 时必填）
-  username: your_target_user
-  password: your_target_password
+  username: xxx
+  password: xxx
+  database: xxx
   charset: utf8mb4
-  timezone: UTC            # 时间列存储时区，默认 UTC（保证时间戳时刻一致）  
+  timezone: UTC
+
+# ===== 目标库（SQL Server）=====
+target:
+  dialect: mysql
+  host: xxx
+  port: 3306
+  username: xxx
+  password: xxx
+  database: xxx          # 目标数据库名
+  charset: utf8mb4
+  timezone: UTC
+
+# ===== 进度存储 =====
+# 目标库为 SQL Server 时，进度后端可用 sqlite 或「独立 MySQL」（state.mysql 段）。
+state:
+  backend: sqlite
+  path: godbsync.db
 
 # ===== 全局选项 =====
-workers: 2                 # 单表写入并发 worker 数
-log_level: debug            # debug / info / warn / error
-batch_timeout: "3m"        # 单批 MySQL 写入超时，默认 5m。大表写入慢时可适当放大
-# oracle_array_binding: true  # Oracle 目标写入是否使用数组绑定（默认 true）。
-                             # 设为 false 可回退到传统 UNION ALL 行展开写法（兼容性更好，已充分验证）。
-auto_validate: true        # 同步完成后自动校验两侧行数（true/false，默认 true）
-validate_sample_size: 100   # 内容校验按主键抽样的行数（默认 100）
-# validate_sample_offset: 0   # 抽样起点（按主键排序后跳过的行数，默认 0=表头）
-# validate_sample_random: false  # 抽样起点是否在表内随机选取（避免总查小主键区）
+workers: 4
+log_level: info
+auto_validate: true
+validate_sample_size: 100
 
 # ===== 待同步表 =====
 tables:
-  # 全量同步示例：每次先清空目标表再全量写入（配置 truncate: true）
-  - name: FAN_TEST       # 源表名（未加引号按大写匹配）
-    target: bas_sn_type_relation_new       #  目标表名（可选，省略则与 name 相同）
+  - name: "*"         # MySQL 源表名（通配符，须加引号）
+    target: "*"       # 目标表名（通配符，须加引号；与源同名）
     mode: full
-    truncate: true         # 写入前清空目标表
-    batch_size: 2000       # 每批写入行数
-    column_mapping:      # 源表名列名→目标表列名的映射（仅需配置名称不同的列）
-       BNNUM: ben_num
-       SNNUM: sn_num
-       YNNUM: yn_num
-       ZSDATE: zs_date
-       ZSTIME: zs_time
-
-  # 增量同步示例：基于水位列 LAST_MODIFIED 持续推进
- # - name: ORDERS
-  #  target: orders
-  #  mode: incremental
-  #  watermark: LAST_MODIFIED   # 单调列（时间戳或自增主键）
-  #  batch_size: 1000
-  #  ignore_errors: false       # 单批失败即终止
+    truncate: true
+    batch_size: 2000
+#  - name: orders
+#    target: Orders
+#    mode: incremental
+#    watermark: updated_at
+#    batch_size: 1000
+#    ignore_errors: false

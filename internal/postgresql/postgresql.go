@@ -67,6 +67,17 @@ func (r *Reader) Placeholder(n int) string { return fmt.Sprintf("$%d", n) }
 // QuoteIdentifier PostgreSQL 使用双引号包裹标识符（与 Oracle 一致）。
 func (r *Reader) QuoteIdentifier(name string) string { return `"` + name + `"` }
 
+// SamplePKQuery 按主键有序抽样：PostgreSQL 使用 LIMIT/OFFSET（各版本通用）。
+func (r *Reader) SamplePKQuery(tableRef string, orderCols []string, offset, limit int64) string {
+	cols := make([]string, len(orderCols))
+	for i, c := range orderCols {
+		cols[i] = r.QuoteIdentifier(c)
+	}
+	sel := strings.Join(cols, ", ")
+	return fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT %d OFFSET %d",
+		sel, tableRef, sel, limit, offset)
+}
+
 // SupportsRowID PostgreSQL 无 ROWID 伪列（ctid 不稳定且需改写 SELECT，暂不启用）；
 // 无单列主键的源表退化为无序全量，与 MySQL/SQL Server 源行为一致。
 func (r *Reader) SupportsRowID() bool { return false }
@@ -83,6 +94,32 @@ func (r *Reader) Normalize(v interface{}, dbType string) interface{} {
 func (r *Reader) IsTimeType(dbType string) bool { return isPostgreSQLTimeType(dbType) }
 
 func (r *Reader) IsNumericType(dbType string) bool { return isPostgreSQLNumericType(dbType) }
+
+// ListTables 枚举 PostgreSQL 源 schema 下所有基表（排除视图与系统 schema），用于通配符 * 整库同步展开。
+// schema 为空时默认 public。
+func (r *Reader) ListTables(db *sql.DB, schema string) ([]string, error) {
+	if schema == "" {
+		schema = "public"
+	}
+	q := `SELECT table_name
+		FROM information_schema.tables
+		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+		ORDER BY table_name`
+	rows, err := db.Query(q, schema)
+	if err != nil {
+		return nil, fmt.Errorf("枚举 PostgreSQL 源库表失败: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
 
 // Open 打开一个 PostgreSQL 连接并配置连接池参数。
 func Open(dsn string) (*sql.DB, error) {
@@ -648,4 +685,46 @@ func pgGenerateCreate(db *sql.DB, table string, cols []types.Column, pk []string
 
 	body := strings.Join(defs, ",\n")
 	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n%s\n)", quotePg(table), body), nil
+}
+
+// GenerateAlter 比对目标表（已存在）现有列与映射后的源列，生成使其一致的 ALTER TABLE 语句。
+// 仅处理「目标缺列（ADD COLUMN）」与「列类型不一致（ALTER COLUMN TYPE）」两类差异；
+// 目标多出而源没有的列不参与（避免误删业务列）。只读目标库、不执行 DDL。
+// 返回空字符串表示结构一致。供整库同步前结构预检：发现不一致由调用方打印并退出。
+func (w *Writer) GenerateAlter(db *sql.DB, table string, srcCols []types.Column) (string, error) {
+	tgtCols, err := readerTableColumns(db, table)
+	if err != nil {
+		return "", fmt.Errorf("读取目标表 %s 现有列失败: %w", table, err)
+	}
+	tgtMap := make(map[string]types.Column, len(tgtCols))
+	for _, c := range tgtCols {
+		tgtMap[strings.ToUpper(c.Name)] = c
+	}
+	qT := w.QuoteIdentifier(table)
+	var stmts []string
+	for _, sc := range srcCols {
+		want, e := pgType(sc)
+		if e != nil {
+			return "", e
+		}
+		qC := w.QuoteIdentifier(sc.Name)
+		tc, ok := tgtMap[strings.ToUpper(sc.Name)]
+		if !ok {
+			line := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			stmts = append(stmts, line+";")
+			continue
+		}
+		have, e := pgType(tc)
+		if e != nil {
+			have = ""
+		}
+		if have != want {
+			line := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s", qT, qC, want, qC, want)
+			stmts = append(stmts, line+";")
+		}
+	}
+	return strings.Join(stmts, "\n"), nil
 }

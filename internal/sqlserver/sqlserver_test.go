@@ -125,11 +125,11 @@ func TestReader_Registered(t *testing.T) {
 
 func TestReader_Placeholder(t *testing.T) {
 	r := &Reader{}
-	if got := r.Placeholder(1); got != "?" {
-		t.Errorf("Placeholder(1) = %q, want ?", got)
+	if got := r.Placeholder(1); got != "@p1" {
+		t.Errorf("Placeholder(1) = %q, want @p1", got)
 	}
-	if got := r.Placeholder(5); got != "?" {
-		t.Errorf("Placeholder(5) = %q, want ?", got)
+	if got := r.Placeholder(5); got != "@p5" {
+		t.Errorf("Placeholder(5) = %q, want @p5", got)
 	}
 }
 
@@ -180,11 +180,11 @@ func TestWriter_Registered(t *testing.T) {
 
 func TestWriter_Placeholder(t *testing.T) {
 	w := &Writer{}
-	if got := w.Placeholder(1); got != "?" {
-		t.Errorf("Placeholder(1) = %q, want ?", got)
+	if got := w.Placeholder(1); got != "@p1" {
+		t.Errorf("Placeholder(1) = %q, want @p1", got)
 	}
-	if got := w.Placeholder(3); got != "?" {
-		t.Errorf("Placeholder(3) = %q, want ?", got)
+	if got := w.Placeholder(3); got != "@p3" {
+		t.Errorf("Placeholder(3) = %q, want @p3", got)
 	}
 }
 
@@ -295,7 +295,7 @@ func TestBuildMergeSQL_WithPK(t *testing.T) {
 	if !strings.Contains(got, "MERGE INTO [users] AS t") {
 		t.Errorf("缺少 MERGE INTO, got:\n%s", got)
 	}
-	if !strings.Contains(got, "USING (VALUES (?,?,?), (?,?,?))") {
+	if !strings.Contains(got, "USING (VALUES (@p1,@p2,@p3), (@p4,@p5,@p6))") {
 		t.Errorf("VALUES 子句不正确, got:\n%s", got)
 	}
 	if !strings.Contains(got, "ON (t.[id] = s.[id])") {
@@ -328,7 +328,7 @@ func TestBuildMergeSQL_OnlyPKColumns(t *testing.T) {
 func TestBuildInsertSQL_NoPK(t *testing.T) {
 	cols := []string{"a", "b"}
 	got := buildInsertSQL("log", cols, 2)
-	if !strings.Contains(got, "INSERT INTO [log] ([a], [b]) VALUES (?,?), (?,?);") {
+	if !strings.Contains(got, "INSERT INTO [log] ([a], [b]) VALUES (@p1,@p2), (@p3,@p4);") {
 		t.Errorf("INSERT SQL 不正确, got:\n%s", got)
 	}
 }
@@ -336,13 +336,15 @@ func TestBuildInsertSQL_NoPK(t *testing.T) {
 // ---- rowValuePlaceholders ----
 
 func TestRowValuePlaceholders(t *testing.T) {
-	if got := rowValuePlaceholders(1); got != "(?)" {
-		t.Errorf("rowValuePlaceholders(1) = %q, want (?)", got)
+	idx := 0
+	if got := rowValuePlaceholders(1, &idx); got != "(@p1)" || idx != 1 {
+		t.Errorf("rowValuePlaceholders(1) = %q (idx=%d), want (@p1) idx=1", got, idx)
 	}
-	if got := rowValuePlaceholders(3); got != "(?,?,?)" {
-		t.Errorf("rowValuePlaceholders(3) = %q, want (?,?,?)", got)
+	idx = 0
+	if got := rowValuePlaceholders(3, &idx); got != "(@p1,@p2,@p3)" || idx != 3 {
+		t.Errorf("rowValuePlaceholders(3) = %q (idx=%d), want (@p1,@p2,@p3) idx=3", got, idx)
 	}
-	if got := rowValuePlaceholders(0); got != "()" {
+	if got := rowValuePlaceholders(0, &idx); got != "()" {
 		t.Errorf("rowValuePlaceholders(0) = %q, want ()", got)
 	}
 }

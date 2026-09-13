@@ -400,6 +400,21 @@ func (c *Config) Validate() error {
 		if t.Name == "" {
 			return fmt.Errorf("tables[%d].name 不能为空", i)
 		}
+		if t.Name == "*" {
+			// 通配符整库同步：目标须同名映射；整库仅支持全量（增量需逐表指定 watermark）。
+			if t.Target != "" && t.Target != "*" {
+				return fmt.Errorf("tables[%d].name 为通配符 * 时 target 须省略或为 *（整库同名映射）", i)
+			}
+			mode := t.Mode
+			if mode == "" {
+				mode = "full"
+			}
+			if mode == "incremental" {
+				return fmt.Errorf("tables[%d].name 为通配符 * 仅支持 full 模式（增量需逐表指定 watermark）", i)
+			}
+			// 通配符条目跳过标识符逐字段校验：展开后的真实表名在 syncer 中已保证合法。
+			continue
+		}
 		if !validIdentifier(t.Name) {
 			return fmt.Errorf("tables[%d].name 含非法字符（仅允许字母、数字、下划线，长度 1..63）", i)
 		}

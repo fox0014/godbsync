@@ -34,6 +34,10 @@ func OpenSQLite(path string) (Backend, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := b.EnsureWrittenRowsTable(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return b, nil
 }
 
@@ -137,6 +141,91 @@ func (b *sqliteBackend) ClearAllCheckpoints() error {
 	q := fmt.Sprintf("DELETE FROM %s", checkpointTable)
 	if _, err := b.db.Exec(q); err != nil {
 		return fmt.Errorf("清除全部断点失败: %w", err)
+	}
+	return nil
+}
+
+// ---- 已写入行数（供 monitor 实时进度展示） ----
+
+func (b *sqliteBackend) EnsureWrittenRowsTable() error {
+	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		table_name   TEXT PRIMARY KEY,
+		source_total BIGINT NOT NULL DEFAULT 0,
+		written_rows BIGINT NOT NULL DEFAULT 0,
+		updated_at   TEXT NOT NULL
+	)`, writtenRowsTable)
+	if _, err := b.db.Exec(ddl); err != nil {
+		return fmt.Errorf("创建已写入行数表失败: %w", err)
+	}
+	// 迁移：旧表可能只有 (table_name, written_rows, updated_at) 三列，补 source_total。
+	if !sqliteHasColumn(b.db, writtenRowsTable, "source_total") {
+		alt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN source_total BIGINT NOT NULL DEFAULT 0", writtenRowsTable)
+		if _, err := b.db.Exec(alt); err != nil {
+			return fmt.Errorf("迁移 written_rows 表失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// sqliteHasColumn 判断表是否含指定列（用于旧表结构迁移）。
+func sqliteHasColumn(db *sql.DB, table, col string) bool {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false
+		}
+		if name == col {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *sqliteBackend) GetWrittenRows(table string) (int64, bool, error) {
+	q := fmt.Sprintf("SELECT written_rows FROM %s WHERE table_name = ?", writtenRowsTable)
+	var n int64
+	if e := b.db.QueryRow(q, table).Scan(&n); e != nil {
+		if e == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("读取已写入行数失败: %w", e)
+	}
+	return n, true, nil
+}
+
+func (b *sqliteBackend) GetSourceTotal(table string) (int64, bool, error) {
+	q := fmt.Sprintf("SELECT source_total FROM %s WHERE table_name = ?", writtenRowsTable)
+	var n int64
+	if e := b.db.QueryRow(q, table).Scan(&n); e != nil {
+		if e == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("读取源总行数失败: %w", e)
+	}
+	return n, true, nil
+}
+
+func (b *sqliteBackend) SetWrittenRows(table string, sourceTotal, written int64) error {
+	q := fmt.Sprintf(`INSERT INTO %s (table_name, source_total, written_rows, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(table_name) DO UPDATE SET source_total = excluded.source_total, written_rows = excluded.written_rows, updated_at = CURRENT_TIMESTAMP`, writtenRowsTable)
+	if _, err := b.db.Exec(q, table, sourceTotal, written); err != nil {
+		return fmt.Errorf("写入已写入行数失败: %w", err)
+	}
+	return nil
+}
+
+func (b *sqliteBackend) ClearWrittenRows(table string) error {
+	q := fmt.Sprintf("DELETE FROM %s WHERE table_name = ?", writtenRowsTable)
+	if _, err := b.db.Exec(q, table); err != nil {
+		return fmt.Errorf("清除已写入行数失败: %w", err)
 	}
 	return nil
 }

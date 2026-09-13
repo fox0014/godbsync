@@ -57,9 +57,10 @@ godbsync daemon -config config.yaml -interval 1m
 godbsync validate -config config.yaml
 
 # 6) 查看同步状态（断点/水位 + 源/目标实时行数一致性）
-godbsync status -config config.yaml                  # 展示各表状态（含实时行数一致性）
-godbsync status -config config.yaml --watch 2s      # 每 2s 刷新一次
-godbsync status -config config.yaml --quick         # 仅读断点/水位，不连库、不统计行数
+godbsync monitor -cli -config config.yaml                  # 终端展示各表状态（含实时行数一致性）
+godbsync monitor -cli -config config.yaml --watch 2s      # 每 2s 刷新一次
+godbsync monitor -cli -config config.yaml --quick         # 仅读断点/水位，不连库、不统计行数
+godbsync monitor -config config.yaml                       # 启动 Web 仪表盘（默认 :8080）
 
 # 7) 断点管理
 godbsync checkpoint                    # 列出全部断点
@@ -109,7 +110,7 @@ godbsync monitor -config config.yaml -table EMPLOYEES,DEPT
 
 | 字段 | 说明 |
 | --- | --- |
-| `source.dialect` / `target.dialect` | 源/目标数据库类型：`oracle`、`mysql` 或 `sqlserver` |
+| `source.dialect` / `target.dialect` | 源/目标数据库类型：`oracle`、`mysql`、`sqlserver` 或 `postgresql` |
 | `oracle.conn_type` | `service`（默认）或 `sid`（仅 dialect=oracle 时生效） |
 | `tables[].mode` | `full`（全量）或 `incremental`（增量） |
 | `tables[].watermark` | 增量模式必填，单调列名（如 `LAST_MODIFIED`） |
@@ -117,15 +118,34 @@ godbsync monitor -config config.yaml -table EMPLOYEES,DEPT
 | `tables[].batch_size` | 每批写入行数 |
 | `tables[].ignore_errors` | 单批失败是否跳过继续 |
 | `tables[].target` | 目标表名（省略则与源表同名；Oracle 目标可写 `OWNER.TABLE` 指定属主） |
-| `tables[].schema` | 源表属主（Oracle/SQL Server 源为 schema，MySQL 源为数据库） |
+| `tables[].schema` | 源表属主（Oracle/SQL Server 源为 schema，MySQL 源为数据库，PostgreSQL 源默认 `public`） |
 | `tables[].column_mapping` | 源列名 → 目标列名的映射 |
+| `source.encrypt` / `target.encrypt` | PostgreSQL/SQL Server SSL 模式（如 `disable`、`require`、`verify-ca`，默认 `disable`） |
 | `workers` | 并发写入 worker 数（全局，默认 `4`） |
 | `auto_validate` | 同步完成后自动校验（默认 `true`） |
 | `validate_sample_size` | 内容校验抽样行数（默认 `100`） |
 | `validate_sample_random` | 抽样起点是否随机（默认 `false`） |
 | `watermark_checkpoint_interval` | 增量水位/全量断点周期检查点间隔秒（默认 `10`） |
-| `state.backend` | 进度后端：`sqlite`（默认，本地文件）或 `mysql`（目标库） |
+| `state.backend` | 进度后端：`sqlite`（默认，本地文件）或 `mysql`（独立 MySQL） |
 | `state.path` | SQLite 文件路径，默认 `godbsync.db`（仅 `sqlite` 后端有效） |
+| `state.mysql` | 独立 MySQL 进度库连接信息（与目标库解耦，任意目标方言均可用） |
+
+## 整库通配符同步
+`tables[].name` 设为 `"*"` 可一次性同步整个源库的所有基表（自动排除视图与系统库表），无需逐张表声明。完整示例见 `examples/config.mysql2mysql.fulldb.yaml`（MySQL 整库 → MySQL）：
+
+```yaml
+tables:
+  - name: "*"        # 匹配源库所有基表
+    target: "*"      # 目标同名（可省略）
+    mode: full
+    truncate: true
+    batch_size: 2000
+```
+
+- 展开在同步启动时（`syncer.Expand()`）由 `reader.ListTables` 枚举源库真实表名完成，目标表与源表同名，并继承 `mode`/`truncate`/`batch_size` 等选项；`init`/`full`/`incr`/`daemon`/`validate` 全部复用。
+- 约束：整库通配符仅支持 `full`（增量需逐表 `watermark`）；`target` 须省略或为 `"*"`。
+- 局限：`monitor`/`status` 等只读配置/进度后端的子命令不展开 `"*"`，只显示模板条目（已同步真实表名在进度后端中）。
+- **结构不一致自动拦截**：`full` 在清空前会对每张已存在的目标表做结构预检（`PreSyncStructureCheck`）。若目标表缺列或列类型与源不一致，工具会打印对应的 `ALTER TABLE` 变更 SQL 并**直接退出（不 truncate、不写入，目标库保持原状）**，需你先执行生成的 DDL 再重跑。仅当通配符整库（`name: "*"`）时启用。
 
 ## 进度存储（配置文件 `state` 段）
 
@@ -165,7 +185,7 @@ CLI `-state` 标志可覆盖配置文件：
 - **增量 + 周期检查点**：基于水位列持续推进，并发写入下周期持久化已提交水位
 - **并发写入**：`workers` 配置批量并发插入
 - **数据校验**：行数比对 + 主键抽样 SHA256 校验和；`auto_validate` 同步后自动触发
-- **同步状态查看**：`status` 只读展示各表同步状态（断点/水位 + 源/目标实时行数一致性），支持 `--watch N` 持续刷新、`--quick` 仅读进度后端
+- **同步状态查看**：`monitor -cli` 终端报告 / `monitor`（或 `-web`）Web 仪表盘，只读进度后端（断点/水位）；`--verify` 实时 COUNT(*) 一致性校验，支持 `--watch N` 持续刷新、`--quick` 仅读进度后端
 - **守护模式**：`daemon` 定时轮询增量
 - **进度可配置**：默认本地 SQLite（`godbsync.db`），目标库为 MySQL 时也可一键切到目标库
 
@@ -188,7 +208,15 @@ godbsync/
     ├── config.yaml                  # Oracle → MySQL 示例
     ├── config.mysql2oracle.yaml     # MySQL → Oracle 示例
     ├── config.sqlserver2mysql.yaml  # SQL Server → MySQL 示例
-    └── config.mysql2sqlserver.yaml   # MySQL → SQL Server 示例
+    ├── config.mysql2sqlserver.yaml  # MySQL → SQL Server 示例
+    ├── config.oracle2sqlserver.yaml # Oracle → SQL Server 示例
+    ├── config.pg2mysql.yaml         # PostgreSQL → MySQL 示例
+    ├── config.mysql2pg.yaml         # MySQL → PostgreSQL 示例
+    ├── config.pg2oracle.yaml        # PostgreSQL → Oracle 示例
+    ├── config.oracle2pg.yaml        # Oracle → PostgreSQL 示例
+    ├── config.sqlserver2pg.yaml     # SQL Server → PostgreSQL 示例
+    ├── config.mysql2mysql.fulldb.yaml      # MySQL 整库 → MySQL（通配符 * 全库）
+    └── config.mysql2oracle.statemysql.yaml  # MySQL → Oracle（状态存独立 MySQL）
 ```
 
 ## 类型映射
@@ -251,6 +279,92 @@ godbsync/
 | `JSON` | `NVARCHAR(MAX)` |
 | `BOOLEAN` / `TINYINT(1)` | `BIT` |
 | `ENUM` / `SET` | `NVARCHAR(255)` |
+
+**各类源 → PostgreSQL（目标端）：**
+
+| 源类型（MySQL/Oracle/SQL Server） | PostgreSQL |
+| --- | --- |
+| `VARCHAR(n)` / `NVARCHAR(n)` / `VARCHAR2(n)` / `NVARCHAR2(n)` | `VARCHAR(n)`（超长 → `TEXT`） |
+| `CHAR(n)` / `NCHAR(n)` | `CHAR(n)` |
+| `INT` / `INTEGER` / `MEDIUMINT` / `SERIAL` | `INTEGER` |
+| `BIGINT` / `BIGSERIAL` | `BIGINT` |
+| `SMALLINT` / `SMALLSERIAL` | `SMALLINT` |
+| `TINYINT` | `SMALLINT`（兼容无符号溢出） |
+| `DECIMAL(p,s)` / `NUMERIC` / `NUMBER` | `NUMERIC(p,s)` |
+| `MONEY` / `SMALLMONEY` | `NUMERIC(19,4)` |
+| `FLOAT` / `BINARY_FLOAT` / `REAL` | `REAL` |
+| `DOUBLE` / `BINARY_DOUBLE` | `DOUBLE PRECISION` |
+| `BOOLEAN` / `BOOL` / `BIT` | `BOOLEAN` |
+| `DATE` | `DATE` |
+| `TIME` / `TIMETZ` | `TIME` |
+| `DATETIME` / `DATETIME2` / `TIMESTAMP` / Oracle 时间类型 | `TIMESTAMP` |
+| `TIMESTAMPTZ` / `DATETIMEOFFSET` | `TIMESTAMPTZ` |
+| `TEXT` / `LONGTEXT` / `CLOB` / `NCLOB` / `NTEXT` / `XML` | `TEXT`（XML → `XML`） |
+| `BLOB` / `LONGBLOB` / `RAW` / `VARBINARY` / `IMAGE` | `BYTEA` |
+| `JSON` / `JSONB` | `JSONB` |
+| `UUID` / `UNIQUEIDENTIFIER` | `UUID` |
+| `ENUM` / `SET` | `TEXT` |
+| `YEAR` | `SMALLINT` |
+
+**PostgreSQL（源端）→ MySQL：**
+
+| PostgreSQL | MySQL |
+| --- | --- |
+| `VARCHAR(n)` / `BPCHAR` | `VARCHAR(n)`（超长 → `LONGTEXT`） |
+| `CHAR(n)` | `CHAR(n)`（>255 → `VARCHAR(255)`） |
+| `INT2` / `SMALLSERIAL` | `SMALLINT` |
+| `INT4` / `SERIAL` | `INT` |
+| `INT8` / `BIGSERIAL` | `BIGINT` |
+| `DECIMAL(p,s)` / `NUMERIC` | `DECIMAL(p,s)` |
+| `FLOAT4` | `FLOAT` |
+| `FLOAT8` / `DOUBLE PRECISION` | `DOUBLE` |
+| `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `TIME` / `TIMETZ` | `DATETIME(6)` |
+| `TEXT` / `CITEXT` / `NAME` | `LONGTEXT` |
+| `BYTEA` | `LONGBLOB` |
+| `BOOLEAN` / `BOOL` | `TINYINT(1)` |
+| `JSON` / `JSONB` | `JSON`（5.7+）/ `LONGTEXT`（<5.7） |
+| `UUID` | `VARCHAR(36)` |
+| `ENUM` | `VARCHAR(255)` |
+| `XML` | `LONGTEXT` |
+
+**PostgreSQL（源端）→ Oracle：**
+
+| PostgreSQL | Oracle |
+| --- | --- |
+| `VARCHAR(n)` / `BPCHAR` | `VARCHAR2(n)`（>4000 → `CLOB`） |
+| `INT2` / `SMALLSERIAL` | `NUMBER(5,0)` |
+| `INT4` / `SERIAL` | `NUMBER(10,0)` |
+| `INT8` / `BIGSERIAL` | `NUMBER(19,0)` |
+| `DECIMAL(p,s)` / `NUMERIC` | `NUMBER(p,s)` |
+| `FLOAT4` / `FLOAT8` / `DOUBLE PRECISION` / `REAL` | `BINARY_FLOAT` / `BINARY_DOUBLE`（10g+） |
+| `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `TIME` | `TIMESTAMP` |
+| `TEXT` / `CITEXT` / `NAME` | `CLOB` |
+| `BYTEA` | `BLOB` |
+| `BOOLEAN` / `BOOL` | `NUMBER(1,0)` |
+| `JSON` / `JSONB` | `CLOB` |
+| `UUID` | `VARCHAR2(36)` |
+| `ENUM` | `VARCHAR2(255)` |
+| `YEAR` | `NUMBER(4,0)` |
+
+**PostgreSQL（源端）→ SQL Server：**
+
+| PostgreSQL | SQL Server |
+| --- | --- |
+| `VARCHAR(n)` / `BPCHAR` | `NVARCHAR(n)`（>4000 → `NVARCHAR(MAX)`） |
+| `INT2` / `SMALLSERIAL` | `SMALLINT` |
+| `INT4` / `SERIAL` | `INT` |
+| `INT8` / `BIGSERIAL` | `BIGINT` |
+| `DECIMAL(p,s)` / `NUMERIC` | `DECIMAL(p,s)` |
+| `FLOAT4` | `REAL` |
+| `FLOAT8` / `DOUBLE PRECISION` / `REAL` | `FLOAT(53)` |
+| `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `TIME` | `DATETIME2` |
+| `TEXT` / `CITEXT` / `NAME` | `NVARCHAR(MAX)` |
+| `BYTEA` | `VARBINARY(MAX)` |
+| `BOOLEAN` / `BOOL` | `BIT` |
+| `JSON` / `JSONB` | `NVARCHAR(MAX)` |
+| `UUID` | `UNIQUEIDENTIFIER` |
+| `ENUM` | `NVARCHAR(255)` |
+| `YEAR` | `SMALLINT` |
 
 > Oracle `NUMBER` 超出 `int64` 精度时以字符串透传，保留完整精度。
 
@@ -316,9 +430,9 @@ tables[0].name 含非法字符（仅允许字母、数字、下划线，长度 1
 ## 注意事项
 
 - 不处理源端删除（无 CDC）
-- 增量依赖单调水位列；MySQL 目标库需提前 `CREATE DATABASE`，Oracle 目标库需确保目标用户/schema 有建表权限，SQL Server 目标库需确保用户有建表权限
-- 无主键表同步会产生重复行（MySQL 目标靠唯一键去重，Oracle/SQL Server 目标无主键时退化为普通 INSERT），校验仅比行数、跳过内容比对
+- 增量依赖单调水位列；MySQL 目标库需提前 `CREATE DATABASE`，Oracle/PostgreSQL 目标库需确保目标用户/schema 有建表权限，SQL Server 目标库需确保用户有建表权限
+- 无主键表同步会产生重复行（MySQL 目标靠唯一键去重，Oracle/SQL Server 目标无主键时退化为普通 INSERT，PostgreSQL 目标无主键时退化为普通 INSERT），校验仅比行数、跳过内容比对
 - 一批数据驻留内存，`batch_size` 过大可能超目标库单批语句长度/包大小限制（如 MySQL `max_allowed_packet`、Oracle 占位符上限、SQL Server 2100 参数上限，工具已自动分块）
 - 非 truncate 全量路径串行提交；大表首跑追求速度可用 `truncate: true`（并发写入，且同样支持断点续传）
 - SQLite 后端多实例勿并发跑同一目标库
-- **目标库为 Oracle 或 SQL Server 时进度后端可用 `sqlite` 或「独立 MySQL」**（在 `state.mysql` 段配置任意 MySQL 连接，与目标库解耦）
+- **目标库为 Oracle、SQL Server 或非 MySQL 方言时进度后端可用 `sqlite` 或「独立 MySQL」**（在 `state.mysql` 段配置任意 MySQL 连接，与目标库解耦）

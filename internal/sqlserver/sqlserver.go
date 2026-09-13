@@ -4,11 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/microsoft/go-mssqldb"
+	mssql "github.com/microsoft/go-mssqldb"
 
 	"godbsync/internal/dialect"
 	"godbsync/internal/types"
@@ -59,9 +60,22 @@ func (r *Reader) ScanRow(rows *sql.Rows, n int) ([]interface{}, error) {
 	return scanRow(rows, n)
 }
 
-func (r *Reader) Placeholder(_ int) string { return "?" }
+func (r *Reader) Placeholder(n int) string { return fmt.Sprintf("@p%d", n) }
 
 func (r *Reader) QuoteIdentifier(name string) string { return "[" + name + "]" }
+
+// SamplePKQuery 按主键有序抽样：SQL Server 用 ROW_NUMBER() 窗口函数。
+// 该函数自 SQL Server 2005 起支持；OFFSET/FETCH 需 2012+，故不用以保证老版本兼容。
+func (r *Reader) SamplePKQuery(tableRef string, orderCols []string, offset, limit int64) string {
+	cols := make([]string, len(orderCols))
+	for i, c := range orderCols {
+		cols[i] = r.QuoteIdentifier(c)
+	}
+	sel := strings.Join(cols, ", ")
+	return fmt.Sprintf(
+		"SELECT %s FROM (SELECT %s, ROW_NUMBER() OVER (ORDER BY %s) AS RN FROM %s) sub WHERE RN > %d AND RN <= %d",
+		sel, sel, sel, tableRef, offset, offset+limit)
+}
 
 // SupportsRowID SQL Server 不支持 ROWID 伪列。
 func (r *Reader) SupportsRowID() bool { return false }
@@ -75,6 +89,32 @@ func (r *Reader) Normalize(v interface{}, dbType string) interface{} {
 func (r *Reader) IsTimeType(dbType string) bool { return isSQLServerTimeType(dbType) }
 
 func (r *Reader) IsNumericType(dbType string) bool { return isSQLServerNumericType(dbType) }
+
+// ListTables 枚举 SQL Server 源库下所有基表（排除视图），用于通配符 * 整库同步展开。
+// schema 为空时默认 dbo。
+func (r *Reader) ListTables(db *sql.DB, schema string) ([]string, error) {
+	if schema == "" {
+		schema = "dbo"
+	}
+	q := `SELECT TABLE_NAME
+		FROM INFORMATION_SCHEMA.TABLES
+		WHERE TABLE_SCHEMA = @p1 AND TABLE_TYPE = 'BASE TABLE'
+		ORDER BY TABLE_NAME`
+	rows, err := db.Query(q, schema)
+	if err != nil {
+		return nil, fmt.Errorf("枚举 SQL Server 源库表失败: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
 
 // Open 打开一个 SQL Server 连接并配置连接池参数。
 // go-mssqldb 是纯 Go 实现，无需安装 SQL Server 客户端。
@@ -142,7 +182,7 @@ func readerPrimaryKey(db *sql.DB, schema, table string) []string {
 		  ON c.CONSTRAINT_NAME = cc.CONSTRAINT_NAME
 		  AND c.TABLE_SCHEMA = cc.TABLE_SCHEMA
 		WHERE c.CONSTRAINT_TYPE = 'PRIMARY KEY'
-		  AND c.TABLE_SCHEMA = ? AND UPPER(c.TABLE_NAME) = UPPER(?)
+		  AND c.TABLE_SCHEMA = @p1 AND UPPER(c.TABLE_NAME) = UPPER(@p2)
 		ORDER BY cc.ORDINAL_POSITION`
 	rows, err := db.Query(q, schema, table)
 	if err != nil {
@@ -301,7 +341,7 @@ func (w *Writer) PrimaryKey(db *sql.DB, database, table string) []string {
 
 func (w *Writer) QuoteIdentifier(name string) string { return "[" + name + "]" }
 
-func (w *Writer) Placeholder(_ int) string { return "?" }
+func (w *Writer) Placeholder(n int) string { return fmt.Sprintf("@p%d", n) }
 
 // sqlserverTruncate 清空目标表（支持 schema.table 形式）。
 func sqlserverTruncate(db *sql.DB, table string) error {
@@ -319,7 +359,7 @@ func sqlserverTableExists(db *sql.DB, database, table string) (bool, error) {
 		schema = "dbo"
 	}
 	q := `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`
+		WHERE TABLE_SCHEMA = @p1 AND TABLE_NAME = @p2`
 	var n int
 	if err := db.QueryRow(q, schema, name).Scan(&n); err != nil {
 		return false, fmt.Errorf("查询表 %s 是否存在失败: %w", table, err)
@@ -500,15 +540,68 @@ func sqlserverGenerateCreate(db *sql.DB, table string, cols []types.Column, pk [
 	return fmt.Sprintf("CREATE TABLE %s (\n%s\n)", quoteID(table), body), nil
 }
 
+// GenerateAlter 比对目标表（已存在）现有列与映射后的源列，生成使其一致的 ALTER TABLE 语句。
+// 仅处理「目标缺列（ADD）」与「列类型不一致（ALTER COLUMN）」两类差异；
+// 目标多出而源没有的列不参与（避免误删业务列）。只读目标库、不执行 DDL。
+// 返回空字符串表示结构一致。供整库同步前结构预检：发现不一致由调用方打印并退出。
+func (w *Writer) GenerateAlter(db *sql.DB, table string, srcCols []types.Column) (string, error) {
+	tgtCols, err := readerTableColumns(db, table)
+	if err != nil {
+		return "", fmt.Errorf("读取目标表 %s 现有列失败: %w", table, err)
+	}
+	tgtMap := make(map[string]types.Column, len(tgtCols))
+	for _, c := range tgtCols {
+		tgtMap[strings.ToUpper(c.Name)] = c
+	}
+	qT := w.QuoteIdentifier(table)
+	var stmts []string
+	for _, sc := range srcCols {
+		want, e := sqlserverType(sc)
+		if e != nil {
+			return "", e
+		}
+		qC := w.QuoteIdentifier(sc.Name)
+		tc, ok := tgtMap[strings.ToUpper(sc.Name)]
+		if !ok {
+			line := fmt.Sprintf("ALTER TABLE %s ADD %s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			stmts = append(stmts, line+";")
+			continue
+		}
+		have, e := sqlserverType(tc)
+		if e != nil {
+			have = ""
+		}
+		if have != want {
+			line := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			stmts = append(stmts, line+";")
+		}
+	}
+	return strings.Join(stmts, "\n"), nil
+}
+
 // ----------------------------------------------------------------
-// 批量写入（MERGE 实现幂等 upsert）
+// 批量写入
 // ----------------------------------------------------------------
 
+// colTypeCache 缓存各（连接, 目标表）的列类型，供 BulkCopy 的值预转换使用，
+// 避免每个批次重复查询目标表元数据。
+var colTypeCache sync.Map // key: fmt.Sprintf("%p|%s", db, target) -> map[string]string
+
 // sqlserverBulkUpsert 批量写入 SQL Server。
-// upsert=false 时强制普通 INSERT（全量首跑，所有行均为新行，且避免 MERGE 的匹配开销）；
-// upsert=true 且有主键时按主键构建 MERGE（命中更新非主键列、未命中插入）；
-// upsert=true 且无主键时退化为普通 INSERT（非幂等，需配合 truncate 使用）。
-// ctx 为 nil 时不限制超时。
+// 优先使用 go-mssqldb 原生 INSERT BULK 流式导入（不受 1000 行 / 2100 参数限制，速度接近 Oracle 数组绑定）；
+// 失败时回退到原 MERGE / INSERT 实现以保证正确性。
+// upsert=false：直接 BulkCopy 进目标表（全量首跑，所有行均为新行）；
+// upsert=true 且有主键：BulkCopy 进临时表、再以单条 MERGE 临时表→目标（幂等，且 MERGE 读取表而非
+//
+//	VALUES，不受 1000 行限制）；
+//
+// upsert=true 且无主键：退化为普通 INSERT（非幂等，需配合 truncate 使用）。
 func sqlserverBulkUpsert(ctx context.Context, db *sql.DB, target string, cols []string, rows [][]interface{}, upsert bool) (int64, error) {
 	n := len(rows)
 	if n == 0 {
@@ -518,9 +611,117 @@ func sqlserverBulkUpsert(ctx context.Context, db *sql.DB, target string, cols []
 	if perRow == 0 {
 		return 0, fmt.Errorf("批量写入 %s 失败: 列数为空", target)
 	}
-	// SQL Server 表值构造器 VALUES（含 MERGE ... USING (VALUES ...)）单条语句最多 1000 行，
-	// 超出报错误 10738。分块须同时受「占位符上限」与「1000 行」双重约束，
-	// 否则单列表（perRow=1）会按 2000 行分块而直接报错。
+	total, err := sqlserverBulkUpsertFast(ctx, db, target, cols, rows, upsert)
+	if err == nil {
+		return total, nil
+	}
+	// 兜底：BulkCopy 不可用时（如极少数不被 makeParam 接受的值类型）回退到 MERGE/INSERT。
+	if s2, e2 := sqlserverBulkUpsertLegacy(ctx, db, target, cols, rows, upsert); e2 == nil {
+		return s2, nil
+	}
+	return total, err
+}
+
+// sqlserverBulkUpsertFast 用 go-mssqldb 原生 BulkCopy（INSERT BULK）流式写入。
+func sqlserverBulkUpsertFast(ctx context.Context, db *sql.DB, target string, cols []string, rows [][]interface{}, upsert bool) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	n := len(rows)
+	perRow := len(cols)
+
+	// 幂等 upsert 需要主键；无主键退化为普通 INSERT（非幂等）。
+	useMerge := upsert
+	if useMerge {
+		if len(sqlserverPrimaryKey(db, target)) == 0 {
+			useMerge = false
+		}
+	}
+
+	// BulkCopy 必须在单条物理连接上完成（底层 TDS 流式协议），故独占一条连接。
+	sqlConn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("获取 SQL Server 连接失败: %w", err)
+	}
+	defer sqlConn.Close()
+
+	var mssqlConn *mssql.Conn
+	if err = sqlConn.Raw(func(dc interface{}) error {
+		c, ok := dc.(*mssql.Conn)
+		if !ok {
+			return fmt.Errorf("底层连接不是 *mssql.Conn（实际 %T），无法使用 BulkCopy", dc)
+		}
+		mssqlConn = c
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	// 目标列类型表，用于把归一化值转换成 BulkCopy 期望的类型（BIT 需 bool、UNIQUEIDENTIFIER 需 16 字节等）。
+	colTypes := sqlserverTargetColTypes(db, target)
+	prep := func(v interface{}, name string) interface{} {
+		return bulkPrep(v, colTypes[strings.ToUpper(name)])
+	}
+
+	var destTable string
+	if useMerge {
+		// 临时表存活于当前独占连接，按 schema 克隆目标结构（空表），再 MERGE 进目标。
+		const staging = "#gds_stg"
+		drop := "IF OBJECT_ID('tempdb.." + staging + "') IS NOT NULL DROP TABLE " + staging
+		if _, e := sqlConn.ExecContext(ctx, drop); e != nil {
+			return 0, fmt.Errorf("清理临时表失败: %w", e)
+		}
+		if _, e := sqlConn.ExecContext(ctx, "SELECT TOP 0 * INTO "+staging+" FROM "+quoteID(target)); e != nil {
+			return 0, fmt.Errorf("创建临时表失败: %w", e)
+		}
+		defer func() {
+			_, _ = sqlConn.ExecContext(context.Background(), drop)
+		}()
+		destTable = staging
+	} else {
+		destTable = quoteID(target)
+	}
+
+	bulk := mssqlConn.CreateBulkContext(ctx, destTable, cols)
+	if !useMerge {
+		// 直接插入目标时加表锁，最小化日志、提速；
+		// KeepNulls 保留源端 NULL（与原 legacy 显式 NULL 参数行为一致，避免被默认值覆盖）。
+		bulk.Options = mssql.BulkOptions{Tablock: true, KeepNulls: true}
+	}
+	for _, r := range rows {
+		vals := make([]interface{}, perRow)
+		for i, v := range r {
+			vals[i] = prep(v, cols[i])
+		}
+		if err = bulk.AddRow(vals); err != nil {
+			return 0, fmt.Errorf("BulkCopy 写入 %s 失败: %w", target, err)
+		}
+	}
+	if _, err = bulk.Done(); err != nil {
+		return 0, fmt.Errorf("BulkCopy 提交 %s 失败: %w", target, err)
+	}
+
+	if useMerge {
+		mergeSQL := buildStagingMergeSQL(target, destTable, cols, sqlserverPrimaryKey(db, target))
+		if _, err = sqlConn.ExecContext(ctx, mergeSQL); err != nil {
+			return 0, fmt.Errorf("MERGE 临时表→目标 %s 失败: %w", target, err)
+		}
+	}
+	return int64(n), nil
+}
+
+// sqlserverBulkUpsertLegacy 原 MERGE / INSERT 实现（作为 BulkCopy 的兜底路径）。
+// SQL Server 表值构造器 VALUES（含 MERGE ... USING (VALUES ...)）单条语句最多 1000 行，
+// 超出报错误 10738；分块须同时受「占位符上限」与「1000 行」双重约束。
+func sqlserverBulkUpsertLegacy(ctx context.Context, db *sql.DB, target string, cols []string, rows [][]interface{}, upsert bool) (int64, error) {
+	n := len(rows)
+	if n == 0 {
+		return 0, nil
+	}
+	perRow := len(cols)
+	if perRow == 0 {
+		return 0, fmt.Errorf("批量写入 %s 失败: 列数为空", target)
+	}
 	const maxRowsPerStmt = 1000
 	maxRows := maxPlaceholders / perRow
 	if maxRows > maxRowsPerStmt {
@@ -586,12 +787,171 @@ func sqlserverBulkUpsert(ctx context.Context, db *sql.DB, target string, cols []
 	return total, nil
 }
 
-// rowValuePlaceholders 生成含 n 个占位符的行模板，如 n=3 -> "(?,?,?)"。
-func rowValuePlaceholders(n int) string {
+// sqlserverTargetColTypes 返回目标表「列名(大写)→数据库类型名」映射，供 BulkCopy 值预转换使用。
+func sqlserverTargetColTypes(db *sql.DB, target string) map[string]string {
+	key := fmt.Sprintf("%p|%s", db, target)
+	if v, ok := colTypeCache.Load(key); ok {
+		return v.(map[string]string)
+	}
+	m := make(map[string]string)
+	if cols, err := readerTableColumns(db, target); err == nil {
+		for _, c := range cols {
+			m[strings.ToUpper(c.Name)] = c.DBType
+		}
+	}
+	colTypeCache.Store(key, m)
+	return m
+}
+
+// bulkPrep 把归一化后的值转换为 go-mssqldb BulkCopy(makeParam) 期望的类型。
+// 重点处理：BIT 列需 bool；UNIQUEIDENTIFIER 列需 16 字节；uint 系列 go-mssqldb 不受理，转 int64。
+func bulkPrep(v interface{}, dbType string) interface{} {
+	base := strings.ToUpper(strings.TrimSpace(dbType))
+	if i := strings.Index(base, "("); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "BIT", "BOOL":
+		if v == nil {
+			return nil // 可空 BIT 列的 NULL 必须保留为 NULL，否则会被 toBool 误写成 false(0)
+		}
+		return toBool(v)
+	case "UNIQUEIDENTIFIER", "UUID":
+		if s, ok := v.(string); ok {
+			if b, ok2 := guidStringToBytes(s); ok2 {
+				return b
+			}
+		}
+	}
+	switch x := v.(type) {
+	case uint:
+		return int64(x)
+	case uint8:
+		return int64(x)
+	case uint16:
+		return int64(x)
+	case uint32:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	}
+	return v
+}
+
+// toBool 将各类值转为 SQL Server BIT 期望的 bool。
+func toBool(v interface{}) interface{} {
+	switch x := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return x
+	case int:
+		return x != 0
+	case int8:
+		return x != 0
+	case int16:
+		return x != 0
+	case int32:
+		return x != 0
+	case int64:
+		return x != 0
+	case uint:
+		return x != 0
+	case uint8:
+		return x != 0
+	case uint16:
+		return x != 0
+	case uint32:
+		return x != 0
+	case uint64:
+		return x != 0
+	case float32:
+		return x != 0
+	case float64:
+		return x != 0
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "1", "true", "t", "yes", "y":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+// guidStringToBytes 把规范 GUID 字符串（xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）转回 16 字节，
+// 与 guidToString 互为逆操作，供 BulkCopy 写入 UNIQUEIDENTIFIER 列。
+func guidStringToBytes(s string) ([]byte, bool) {
+	s = strings.ReplaceAll(s, "-", "")
+	if len(s) != 32 {
+		return nil, false
+	}
+	b := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		v, err := strconv.ParseUint(s[i*2:i*2+2], 16, 8)
+		if err != nil {
+			return nil, false
+		}
+		b[i] = byte(v)
+	}
+	return b, true
+}
+
+// buildStagingMergeSQL 生成「MERGE 临时表→目标表」语句：以主键做 ON 匹配，
+// 命中更新非主键列、未命中插入整行。MERGE 读取表而非 VALUES，不受 1000 行 / 2100 参数限制。
+func buildStagingMergeSQL(target, staging string, cols []string, pk []string) string {
+	pkSet := make(map[string]bool, len(pk))
+	for _, k := range pk {
+		pkSet[strings.ToUpper(k)] = true
+	}
+	var onParts []string
+	for _, c := range cols {
+		if pkSet[strings.ToUpper(c)] {
+			onParts = append(onParts, "t.["+c+"] = s.["+c+"]")
+		}
+	}
+	onClause := strings.Join(onParts, " AND ")
+
+	var updates []string
+	for _, c := range cols {
+		if pkSet[strings.ToUpper(c)] {
+			continue
+		}
+		updates = append(updates, "t.["+c+"] = s.["+c+"]")
+	}
+	updateClause := ""
+	if len(updates) > 0 {
+		updateClause = " WHEN MATCHED THEN UPDATE SET " + strings.Join(updates, ", ")
+	}
+
+	insertCols := make([]string, len(cols))
+	insertVals := make([]string, len(cols))
+	for i, c := range cols {
+		insertCols[i] = "[" + c + "]"
+		insertVals[i] = "s.[" + c + "]"
+	}
+	insertClause := fmt.Sprintf(" WHEN NOT MATCHED THEN INSERT (%s) VALUES (%s)",
+		strings.Join(insertCols, ", "), strings.Join(insertVals, ", "))
+
+	return "MERGE INTO " + quoteID(target) + " AS t USING (SELECT * FROM " + quoteID(staging) +
+		") AS s ON (" + onClause + ")" + updateClause + insertClause + ";"
+}
+
+// rowValuePlaceholders 生成含 n 个顺序命名占位符的行模板，如 n=3 -> "(@p1,@p2,@p3)"。
+// 通过 *idx 维护全局参数序号，保证整条语句中每个占位符唯一（SQL Server 不支持 ? 占位符，
+// 仅支持 @p1/@p2... 命名参数）；调用后 *idx 已推进 n。
+func rowValuePlaceholders(n int, idx *int) string {
 	if n <= 0 {
 		return "()"
 	}
-	return "(" + strings.Repeat("?,", n-1) + "?)"
+	parts := make([]string, n)
+	for i := 0; i < n; i++ {
+		*idx++
+		parts[i] = fmt.Sprintf("@p%d", *idx)
+	}
+	return "(" + strings.Join(parts, ",") + ")"
 }
 
 // buildMergeSQL 生成 SQL Server MERGE 语句：
@@ -603,11 +963,11 @@ func buildMergeSQL(target string, cols []string, pk []string, rowCount int) stri
 		pkSet[strings.ToUpper(k)] = true
 	}
 
-	// VALUES 子句：每行 (?,?,?,...)
-	rowPlaceholder := rowValuePlaceholders(len(cols))
+	// VALUES 子句：每行 (@p..,@p..,...)，占位符序号整体递增保证唯一
+	idx := 0
 	var valuesRows []string
 	for i := 0; i < rowCount; i++ {
-		valuesRows = append(valuesRows, rowPlaceholder)
+		valuesRows = append(valuesRows, rowValuePlaceholders(len(cols), &idx))
 	}
 	valuesClause := strings.Join(valuesRows, ", ")
 
@@ -656,10 +1016,10 @@ func buildMergeSQL(target string, cols []string, pk []string, rowCount int) stri
 
 // buildInsertSQL 生成无主键时的普通多行 INSERT（非幂等）。
 func buildInsertSQL(target string, cols []string, rowCount int) string {
-	rowPlaceholder := rowValuePlaceholders(len(cols))
+	idx := 0
 	var valuesRows []string
 	for i := 0; i < rowCount; i++ {
-		valuesRows = append(valuesRows, rowPlaceholder)
+		valuesRows = append(valuesRows, rowValuePlaceholders(len(cols), &idx))
 	}
 	insertCols := make([]string, len(cols))
 	for i, c := range cols {

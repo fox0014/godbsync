@@ -22,6 +22,9 @@ func (s *Syncer) FullSync(t config.TableConfig, fresh bool) (*ValidateBoundary, 
 	if err := s.state.EnsureCheckpointTable(); err != nil {
 		return nil, err
 	}
+	if err := s.state.EnsureWrittenRowsTable(); err != nil {
+		return nil, err
+	}
 
 	cols, err := s.reader.TableColumns(s.sourceDB, srcRef)
 	if err != nil {

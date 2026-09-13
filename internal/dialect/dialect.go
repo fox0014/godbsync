@@ -41,6 +41,15 @@ type Reader interface {
 	IsTimeType(dbType string) bool
 	// IsNumericType 判断给定的数据库类型名是否为数值类型。
 	IsNumericType(dbType string) bool
+	// ListTables 枚举源库（schema）下所有基表名，用于通配符 * 整库同步展开。
+	ListTables(db *sql.DB, schema string) ([]string, error)
+	// SamplePKQuery 生成「按 orderCols 有序、取第 [offset, offset+limit) 行」的主键抽样查询，
+	// 供校验阶段抽样比对使用；返回的查询只投影 orderCols 这些主键列。
+	// 分页语法由各方言自行实现：MySQL/PostgreSQL 用 LIMIT/OFFSET，Oracle 用 ROWNUM 子查询，
+	// SQL Server 用 ROW_NUMBER()。syncer 不硬编码任何窗口函数，从而兼容不支持
+	// ROW_NUMBER() OVER 的老版本数据库（如 MySQL 5.7）。
+	// orderCols 为未加引号的原始列名，由方言内部用 QuoteIdentifier 自行引用。
+	SamplePKQuery(tableRef string, orderCols []string, offset, limit int64) string
 }
 
 // Writer 抽象目标数据库的写入操作，使 syncer 不直接依赖具体驱动包。
@@ -65,6 +74,11 @@ type Writer interface {
 	// GenerateCreate 根据源列元数据生成本方言的 CREATE TABLE 语句。
 	// db 为目标库连接，方言可据此探测服务端版本并自动降级 DDL（如老版本 MySQL/Oracle）。
 	GenerateCreate(db *sql.DB, table string, cols []types.Column, pk []string) (string, error)
+	// GenerateAlter 比对目标表现有列与（已映射为目标列名的）源列，生成使其一致的 ALTER TABLE 语句。
+	// 仅处理两类差异：目标缺列（ADD COLUMN）与列类型不一致（MODIFY / ALTER COLUMN）；
+	// 目标多出而源没有的列不参与（避免误删业务列）。只读目标库、不执行任何 DDL；
+	// 返回空字符串表示结构一致。供整库同步前的结构预检：发现不一致时由调用方打印并退出，目标库保持原状。
+	GenerateAlter(db *sql.DB, table string, srcCols []types.Column) (string, error)
 
 	// RowCount 返回目标表当前行数（用于校验）。
 	RowCount(db *sql.DB, table string) (int64, error)

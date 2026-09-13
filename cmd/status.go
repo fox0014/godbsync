@@ -18,6 +18,32 @@ import (
 // errQuickSkip 标记 quick 模式下未统计行数，用于让 SOURCE/TARGET/DELTA 列显示 “—”。
 var errQuickSkip = errors.New("quick mode: row counts skipped")
 
+// monitorQueryTimeout 是 monitor 实时行数（COUNT(*)）查询的超时上限。
+// 全量同步进行中，目标库（尤其 SQL Server）在活跃批量写入下 COUNT(*) 可能极慢甚至挂起，
+// 不加超时会导致 /api/status 整个响应阻塞、前端永远拿不到数据（页面空白）。
+// 超时即视为查询失败，对应列显示 “—”，但不影响 written_rows 进度展示。
+const monitorQueryTimeout = 3 * time.Second
+
+// rowCountWithTimeout 在超时保护下执行行数统计，避免慢查询/挂起阻塞调用方。
+// 超时返回显式错误（不返回部分结果），由调用方决定如何降级展示。
+func rowCountWithTimeout(fn func() (int64, error), timeout time.Duration) (int64, error) {
+	type rc struct {
+		n   int64
+		err error
+	}
+	ch := make(chan rc, 1)
+	go func() {
+		n, err := fn()
+		ch <- rc{n, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.n, r.err
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("行数统计超时（%s），已降级展示", timeout)
+	}
+}
+
 // 状态着色的 ANSI 转义码（尊重 NO_COLOR 环境变量）。
 const (
 	cGreen  = "\033[32m"
@@ -43,13 +69,13 @@ const (
 	wProg  = 9
 )
 
-// runStatus 渲染同步状态表。quick=false 时额外实时统计源/目标行数做一致性校验；
+// runStatus 渲染同步状态表。live=true 时额外执行实时 COUNT(*) 做一致性校验；
 // watch>0 时按该间隔循环刷新（不清屏，每次重打印并带刷新时间）。
 // filter 非空时仅展示匹配（按 Name 或 TargetName，大小写不敏感）的表。
-func runStatus(cfg *config.Config, st state.Backend, odb, mdb *sql.DB, quick bool, watch time.Duration, scroll bool, log *logrus.Logger, filter []string) int {
+func runStatus(cfg *config.Config, st state.Backend, odb, mdb *sql.DB, live bool, watch time.Duration, scroll bool, log *logrus.Logger, filter []string) int {
 	var reader dialect.Reader
 	var writer dialect.Writer
-	if !quick {
+	if live {
 		if r, err := dialect.NewReader(cfg.Source.Dialect); err == nil {
 			reader = r
 		}
@@ -81,7 +107,7 @@ func runStatus(cfg *config.Config, st state.Backend, odb, mdb *sql.DB, quick boo
 			cfg.Target.Dialect, cfg.Target.Host, cfg.Target.Port)
 		renderStatusHeader()
 		for _, t := range tables {
-			renderStatusRow(cfg, st, odb, mdb, reader, writer, t, quick, log)
+			renderStatusRow(cfg, st, odb, mdb, reader, writer, t, live, log)
 		}
 		if watch <= 0 {
 			break
@@ -144,23 +170,30 @@ func renderStatusHeader() {
 }
 
 // StatusRow 是一张表的同步状态快照，供 status 文本渲染与 monitor Web 仪表盘共用。
-// 指针字段（Source/Target/Delta）为 nil 表示「未统计」（对应文本界面的 “—”）；
-// Progress 为 nil 表示进度未知（对应文本界面的 “—”）。
+// 指针字段（Source/Target/Delta）为 nil 表示「未统计」（对应文本界面的 "—"）；
+// Progress 为 nil 表示进度未知（对应文本界面的 "—"）；
+// WrittenRows 为 nil 表示 state 后端无已写入行数记录（同步未开始或已结束）。
 type StatusRow struct {
-	Table    string   `json:"table"`
-	Mode     string   `json:"mode"`
-	State    string   `json:"state"` // OK/DIVERGED/PENDING/SYNCED/ERR
-	Source   *int64   `json:"source,omitempty"`
-	Target   *int64   `json:"target,omitempty"`
-	Delta    *int64   `json:"delta,omitempty"`
-	Progress *float64 `json:"progress,omitempty"` // 0..100，nil 表示未知
-	LastSync string   `json:"last_sync"`
+	Table       string   `json:"table"`
+	Mode        string   `json:"mode"`
+	State       string   `json:"state"` // OK/DIVERGED/PENDING/SYNCED/ERR
+	Source      *int64   `json:"source,omitempty"`
+	Target      *int64   `json:"target,omitempty"`
+	Delta       *int64   `json:"delta,omitempty"`
+	Progress    *float64 `json:"progress,omitempty"`     // 0..100，nil 表示未知
+	WrittenRows *int64   `json:"written_rows,omitempty"` // syncer 上报的已写入行数
+	LastSync    string   `json:"last_sync"`
 }
 
-// computeStatusRow 计算单表状态快照（只读进度后端 + 可选实时行数）。
-// 文本渲染（renderStatusRow）与 Web 仪表盘（monitor）共用同一份逻辑，避免分叉。
+// computeStatusRow 计算单表状态快照。
+// 默认（live=false）纯后端驱动：源行数来自 state 后端的 source_total，已写入来自 written_rows，
+// 进度 = written_rows / source_total，不查询任何业务库（monitor 默认，避免对大表反复 COUNT(*)）。
+// live=true 时额外执行实时 COUNT(*) 做一致性校验（status --verify / monitor ?verify=1），
+// 填充目标行数/差值并据真实计数判定 OK/DIVERGED/ERR。
+// timeout>0 时对实时行数（COUNT(*)）查询施加超时保护，避免慢查询/挂起阻塞调用方；
+// timeout==0 表示不限制（status CLI 一次性检查可用，monitor 应传 monitorQueryTimeout）。
 func computeStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
-	reader dialect.Reader, writer dialect.Writer, t config.TableConfig, quick bool, log *logrus.Logger) StatusRow {
+	reader dialect.Reader, writer dialect.Writer, t config.TableConfig, live bool, timeout time.Duration, log *logrus.Logger) StatusRow {
 
 	target := t.TargetName()
 	mode := t.ResolveMode()
@@ -188,20 +221,48 @@ func computeStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
 		}
 	}
 
-	// —— 实时行数（一致性校验）——
+	// —— 后端派生数据（monitor 默认数据源，零业务库查询）——
+	var srcTotal, written int64
+	var srcTotalFound, writtenFound bool
+	if w, wf, werr := st.GetWrittenRows(target); werr != nil {
+		log.Warnf("读取表 %s 已写入行数失败: %v", target, werr)
+	} else if wf {
+		written = w
+		writtenFound = true
+	}
+	if st, stf, serr := st.GetSourceTotal(target); serr != nil {
+		log.Warnf("读取表 %s 源总行数失败: %v", target, serr)
+	} else if stf {
+		srcTotal = st
+		srcTotalFound = true
+	}
+
+	// —— 实时行数（仅 live 模式做一致性校验，默认跳过）——
 	var srcCnt, tgtCnt int64
 	var srcErr, tgtErr error
-	if quick {
+	if !live {
 		srcErr, tgtErr = errQuickSkip, errQuickSkip
 	} else {
 		if odb != nil && reader != nil {
-			srcCnt, srcErr = reader.RowCount(odb, t.SourceRef(cfg.Source.Schema), "", nil)
+			if timeout > 0 {
+				srcCnt, srcErr = rowCountWithTimeout(func() (int64, error) {
+					return reader.RowCount(odb, t.SourceRef(cfg.Source.Schema), "", nil)
+				}, timeout)
+			} else {
+				srcCnt, srcErr = reader.RowCount(odb, t.SourceRef(cfg.Source.Schema), "", nil)
+			}
 		} else if odb != nil {
 			// 防御：连接已建但 Reader 不可用（理论上不会发生，openSourceDB 已校验方言）。
 			srcErr = fmt.Errorf("源端 Reader 不可用（方言 %s 未注册）", cfg.Source.Dialect)
 		}
 		if mdb != nil && writer != nil {
-			tgtCnt, tgtErr = writer.RowCount(mdb, target)
+			if timeout > 0 {
+				tgtCnt, tgtErr = rowCountWithTimeout(func() (int64, error) {
+					return writer.RowCount(mdb, target)
+				}, timeout)
+			} else {
+				tgtCnt, tgtErr = writer.RowCount(mdb, target)
+			}
 		} else if mdb != nil {
 			tgtErr = fmt.Errorf("目标端 Writer 不可用（方言 %s 未注册）", cfg.Target.Dialect)
 		}
@@ -209,8 +270,8 @@ func computeStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
 
 	// —— 状态判定 ——
 	stateStr := "PENDING"
-	if !quick {
-		// 非 quick：以实时行数一致性为准；任一侧统计失败则标记 ERR，避免把“查不到”伪装成“已同步”。
+	if live {
+		// verify 模式：以真实计数一致性为准。
 		if srcErr == nil && tgtErr == nil {
 			if srcCnt == tgtCnt {
 				stateStr = "OK"
@@ -226,16 +287,32 @@ func computeStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
 				log.Warnf("表 %s 目标行数统计失败: %v", t.Name, tgtErr)
 			}
 		}
-	} else if found {
-		// quick 模式：仅依据断点/水位判断“是否曾同步过”。
-		stateStr = "SYNCED"
+	} else {
+		// 后端模式：依据 written_rows 与 source_total 判定，不查业务库。
+		if writtenFound && srcTotalFound && srcTotal > 0 {
+			if written >= srcTotal {
+				stateStr = "OK"
+			} else {
+				stateStr = "SYNCING" // 同步进行中：written < source_total
+			}
+		} else if writtenFound {
+			// 有写入记录但无源总数（理论上不会发生，source_total 与 written 同时写入）。
+			stateStr = "SYNCING"
+		} else if found {
+			// 无写入记录但曾同步过（断点/水位存在）→ 视为已同步完成。
+			stateStr = "SYNCED"
+		}
 	}
 	row.State = stateStr
 
 	// —— 行数 ——
-	if srcErr == nil {
+	// 源行数：后端 source_total 优先（仅当 >0，避免旧数据迁移出的 0 误导）；verify 模式退化为实时 COUNT 结果。
+	if srcTotalFound && srcTotal > 0 {
+		row.Source = &srcTotal
+	} else if srcErr == nil {
 		row.Source = &srcCnt
 	}
+	// 目标行数与差值：仅 verify 模式有真实值；后端模式不查目标库，留空（—）。
 	if tgtErr == nil {
 		row.Target = &tgtCnt
 	}
@@ -244,15 +321,23 @@ func computeStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
 		row.Delta = &d
 	}
 
-	// —— 进度百分比（目标已写入行数 / 源端总行数）——
-	// 仅非 quick 模式（有实时行数）可算；源/目标行数统计失败则未知。
-	// 全量同步进行中此值即完成度；增量/已一致表趋近 100%。
-	// 源端 0 行且目标 0 行 → 视为 100%（无可同步数据）。
-	if srcErr == nil && tgtErr == nil {
-		if srcCnt > 0 {
-			p := float64(tgtCnt) / float64(srcCnt) * 100
+	// —— 进度百分比 ——
+	// 分母优先用后端 source_total，回退实时 srcCnt（仅 verify 模式有）。
+	var denom int64
+	if srcTotalFound && srcTotal > 0 {
+		denom = srcTotal
+	} else if srcErr == nil && srcCnt > 0 {
+		denom = srcCnt
+	} else if srcErr == nil && srcCnt == 0 {
+		denom = 0 // 源 0 行
+	}
+	if writtenFound {
+		row.WrittenRows = &written
+		if denom > 0 {
+			p := float64(written) / float64(denom) * 100
 			row.Progress = &p
-		} else if tgtCnt == 0 {
+		} else if denom == 0 && written == 0 {
+			// 源 0 行且未写入 → 100% 完成。
 			p := 100.0
 			row.Progress = &p
 		}
@@ -262,9 +347,10 @@ func computeStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
 }
 
 func renderStatusRow(cfg *config.Config, st state.Backend, odb, mdb *sql.DB,
-	reader dialect.Reader, writer dialect.Writer, t config.TableConfig, quick bool, log *logrus.Logger) {
+	reader dialect.Reader, writer dialect.Writer, t config.TableConfig, live bool, log *logrus.Logger) {
 
-	row := computeStatusRow(cfg, st, odb, mdb, reader, writer, t, quick, log)
+	// status CLI 一次性检查，允许较长等待（30s），但不无限阻塞。
+	row := computeStatusRow(cfg, st, odb, mdb, reader, writer, t, live, 30*time.Second, log)
 
 	// 状态着色：OK/SYNCED→绿，DIVERGED/ERR→红，PENDING→黄。
 	stateCode := cYellow

@@ -478,6 +478,52 @@ func GenerateCreate(db *sql.DB, table string, cols []types.Column, pk []string) 
 	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (\n%s\n) ENGINE=InnoDB DEFAULT CHARSET=%s", table, body, charset), nil
 }
 
+// GenerateAlter 比对目标表（已存在）现有列与映射后的源列，生成使其一致的 ALTER TABLE 语句。
+// 仅处理「目标缺列（ADD COLUMN）」与「列类型不一致（MODIFY）」两类差异；
+// 目标多出而源没有的列不参与（避免误删业务列）。只读目标库、不执行 DDL。
+// 返回空字符串表示结构一致。供整库同步前结构预检：发现不一致由调用方打印并退出。
+func (w *Writer) GenerateAlter(db *sql.DB, table string, srcCols []types.Column) (string, error) {
+	tgtCols, err := readerTableColumns(db, table)
+	if err != nil {
+		return "", fmt.Errorf("读取目标表 %s 现有列失败: %w", table, err)
+	}
+	ver := detectMySQLVersion(db)
+	tgtMap := make(map[string]types.Column, len(tgtCols))
+	for _, c := range tgtCols {
+		tgtMap[strings.ToUpper(c.Name)] = c
+	}
+	qT := w.QuoteIdentifier(table)
+	var stmts []string
+	for _, sc := range srcCols {
+		want, e := mysqlTypeForVersion(sc, ver)
+		if e != nil {
+			return "", e
+		}
+		qC := w.QuoteIdentifier(sc.Name)
+		tc, ok := tgtMap[strings.ToUpper(sc.Name)]
+		if !ok {
+			line := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			stmts = append(stmts, line+";")
+			continue
+		}
+		have, e := mysqlTypeForVersion(tc, ver)
+		if e != nil {
+			have = "" // 目标列类型无法识别：保守生成 MODIFY 以便人工核对
+		}
+		if have != want {
+			line := fmt.Sprintf("ALTER TABLE %s MODIFY %s %s", qT, qC, want)
+			if !sc.Nullable {
+				line += " NOT NULL"
+			}
+			stmts = append(stmts, line+";")
+		}
+	}
+	return strings.Join(stmts, "\n"), nil
+}
+
 // ----------------------------------------------------------------
 // Reader 实现（MySQL 作为同步源端）
 // ----------------------------------------------------------------
@@ -522,6 +568,18 @@ func (r *Reader) Placeholder(_ int) string { return "?" }
 
 func (r *Reader) QuoteIdentifier(name string) string { return "`" + name + "`" }
 
+// SamplePKQuery 按主键有序抽样：MySQL 使用 LIMIT/OFFSET，5.7 与 8.0 通用。
+// 不使用 ROW_NUMBER() OVER —— 该窗口函数仅 MySQL 8.0+ 支持，5.7 会直接报语法错误。
+func (r *Reader) SamplePKQuery(tableRef string, orderCols []string, offset, limit int64) string {
+	cols := make([]string, len(orderCols))
+	for i, c := range orderCols {
+		cols[i] = r.QuoteIdentifier(c)
+	}
+	sel := strings.Join(cols, ", ")
+	return fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT %d OFFSET %d",
+		sel, tableRef, sel, limit, offset)
+}
+
 // SupportsRowID MySQL 不支持 ROWID 伪列。
 func (r *Reader) SupportsRowID() bool { return false }
 
@@ -533,6 +591,28 @@ func (r *Reader) Normalize(v interface{}, dbType string) interface{} { return no
 func (r *Reader) IsTimeType(dbType string) bool { return isMySQLTimeType(dbType) }
 
 func (r *Reader) IsNumericType(dbType string) bool { return isMySQLNumericType(dbType) }
+
+// ListTables 枚举 MySQL 源库下所有基表（排除视图与系统库），用于通配符 * 整库同步展开。
+func (r *Reader) ListTables(db *sql.DB, schema string) ([]string, error) {
+	q := `SELECT TABLE_NAME
+		FROM INFORMATION_SCHEMA.TABLES
+		WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
+		ORDER BY TABLE_NAME`
+	rows, err := db.Query(q, schema)
+	if err != nil {
+		return nil, fmt.Errorf("枚举 MySQL 源库 %s 表失败: %w", schema, err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
 
 // readerTableColumns 通过 "SELECT * FROM <ref> WHERE 1=0" 获取列元数据。
 func readerTableColumns(db *sql.DB, tableRef string) ([]types.Column, error) {

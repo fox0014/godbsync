@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	watermarkTable  = "godbsync_watermark"
-	checkpointTable = "godbsync_checkpoint"
+	watermarkTable   = "godbsync_watermark"
+	checkpointTable  = "godbsync_checkpoint"
+	writtenRowsTable = "godbsync_written_rows"
 )
 
 // mysqlBackend 把进度表建在 MySQL 目标库内。
@@ -127,6 +128,72 @@ func (b *mysqlBackend) ClearAllCheckpoints() error {
 	q := fmt.Sprintf("DELETE FROM %s", checkpointTable)
 	if _, err := b.db.Exec(q); err != nil {
 		return fmt.Errorf("清除全部断点失败: %w", err)
+	}
+	return nil
+}
+
+// ---- 已写入行数（供 monitor 实时进度展示） ----
+
+func (b *mysqlBackend) EnsureWrittenRowsTable() error {
+	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		table_name   VARCHAR(128) NOT NULL PRIMARY KEY,
+		source_total BIGINT       NOT NULL DEFAULT 0,
+		written_rows BIGINT       NOT NULL DEFAULT 0,
+		updated_at   DATETIME     NOT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, writtenRowsTable)
+	if _, err := b.db.Exec(ddl); err != nil {
+		return fmt.Errorf("创建已写入行数表失败: %w", err)
+	}
+	// 迁移：旧表可能缺 source_total 列，补上。
+	var cnt int
+	chk := fmt.Sprintf(`SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'source_total'`)
+	if err := b.db.QueryRow(chk, writtenRowsTable).Scan(&cnt); err == nil && cnt == 0 {
+		alt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN source_total BIGINT NOT NULL DEFAULT 0", writtenRowsTable)
+		if _, err := b.db.Exec(alt); err != nil {
+			return fmt.Errorf("迁移 written_rows 表失败: %w", err)
+		}
+	}
+	return nil
+}
+
+func (b *mysqlBackend) GetWrittenRows(table string) (int64, bool, error) {
+	q := fmt.Sprintf("SELECT written_rows FROM %s WHERE table_name = ?", writtenRowsTable)
+	var n int64
+	if e := b.db.QueryRow(q, table).Scan(&n); e != nil {
+		if e == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("读取已写入行数失败: %w", e)
+	}
+	return n, true, nil
+}
+
+func (b *mysqlBackend) GetSourceTotal(table string) (int64, bool, error) {
+	q := fmt.Sprintf("SELECT source_total FROM %s WHERE table_name = ?", writtenRowsTable)
+	var n int64
+	if e := b.db.QueryRow(q, table).Scan(&n); e != nil {
+		if e == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("读取源总行数失败: %w", e)
+	}
+	return n, true, nil
+}
+
+func (b *mysqlBackend) SetWrittenRows(table string, sourceTotal, written int64) error {
+	q := fmt.Sprintf(`INSERT INTO %s (table_name, source_total, written_rows, updated_at) VALUES (?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE source_total = VALUES(source_total), written_rows = VALUES(written_rows), updated_at = NOW()`, writtenRowsTable)
+	if _, err := b.db.Exec(q, table, sourceTotal, written); err != nil {
+		return fmt.Errorf("写入已写入行数失败: %w", err)
+	}
+	return nil
+}
+
+func (b *mysqlBackend) ClearWrittenRows(table string) error {
+	q := fmt.Sprintf("DELETE FROM %s WHERE table_name = ?", writtenRowsTable)
+	if _, err := b.db.Exec(q, table); err != nil {
+		return fmt.Errorf("清除已写入行数失败: %w", err)
 	}
 	return nil
 }

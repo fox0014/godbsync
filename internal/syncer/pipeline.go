@@ -123,11 +123,16 @@ func (s *Syncer) runConcurrentPipeline(
 		}
 		dirty = false
 		advancedTotal = 0
+		writtenSoFar := total.Load()
 		ckMu.Unlock()
 
 		doFlushMu.Lock()
 		if e := persistAnchor(wm); e != nil {
 			s.log.Warnf("周期持久化进度失败 %s: %v", target, e)
+		}
+		// 同步刷新已写入行数与源端总行数，供 monitor 实时展示进度（不依赖目标表 COUNT(*)）。
+		if e := s.state.SetWrittenRows(target, tracker.Total(), writtenSoFar); e != nil {
+			s.log.Warnf("持久化已写入行数失败 %s: %v", target, e)
 		}
 		doFlushMu.Unlock()
 	}

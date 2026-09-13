@@ -8,7 +8,8 @@
 :root{
   --bg:#f6f8fa; --panel:#ffffff; --border:#d0d7de; --text:#1f2328; --muted:#656d76;
   --ok:#1a7f37; --ok-bg:#dafbe1; --div:#cf222e; --div-bg:#ffebe9;
-  --pend:#9a6700; --pend-bg:#fff8c5; --sync:#0969da; --sync-bg:#ddf4ff; --err:#cf222e; --err-bg:#ffebe9;
+  --pend:#9a6700; --pend-bg:#fff8c5; --sync:#0969da; --sync-bg:#ddf4ff;
+  --err:#cf222e; --err-bg:#ffebe9; --warn:#bf8700; --warn-bg:#fff1c0;
   --bar-bg:#eaeef2; --bar-fill:#1a7f37;
 }
 *{box-sizing:border-box}
@@ -39,6 +40,15 @@ td.num{text-align:right;}
 .badge.DIVERGED,.badge.ERR{color:var(--div);background:var(--div-bg);}
 .badge.PENDING{color:var(--pend);background:var(--pend-bg);}
 .badge.SYNCED{color:var(--sync);background:var(--sync-bg);}
+.badge.SYNCING{color:var(--warn);background:var(--warn-bg);}
+.badge.IN_PROGRESS{color:var(--warn);background:var(--warn-bg);}
+.badge.COMPLETED{color:var(--ok);background:var(--ok-bg);}
+.badge.PENDING{color:var(--pend);background:var(--pend-bg);}
+.badge.DIVERGED{color:var(--div);background:var(--div-bg);}
+.badge.ERROR{color:var(--err);background:var(--err-bg);}
+.overall{display:flex;align-items:center;gap:14px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:20px;flex-wrap:wrap;}
+.overall .pbar{display:block;flex:1 1 200px;height:20px;min-width:160px;max-width:560px;}
+.overall .pct{font-size:14px;font-weight:700;}
 .pbar{position:relative;background:var(--bar-bg);border-radius:4px;height:16px;width:90px;overflow:hidden;display:inline-block;vertical-align:middle;}
 .pbar > i{position:absolute;left:0;top:0;bottom:0;background:var(--bar-fill);}
 .pct{margin-left:6px;font-size:12px;color:var(--muted);}
@@ -63,26 +73,33 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 24px;text-align:center;}
     </select>
   </span>
   <button id="pause">暂停</button>
+  <button id="verify" title="对源/目标库执行实时 COUNT(*) 做一致性校验（默认仅读进度后端，不查业务库）">校验一致性</button>
 </header>
 
 <main>
+  <div class="overall" id="overall">
+    <span class="badge" id="overall-badge">—</span>
+    <span id="overall-text" class="muted"></span>
+    <span class="pbar"><i id="overall-fill" style="width:0%"></i></span>
+    <span class="pct" id="overall-pct">—</span>
+  </div>
   <div class="banner" id="banner"></div>
   <div class="cards" id="cards"></div>
   <table>
     <thead><tr>
       <th>表</th><th>模式</th><th>状态</th>
-      <th class="num">源行数</th><th class="num">目标行数</th><th class="num">差值</th>
+      <th class="num">源行数</th><th class="num">已写入</th><th class="num">目标行数</th><th class="num">差值</th>
       <th>进度</th><th>最后同步</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
   <p class="muted" id="updated" style="margin-top:12px"></p>
 </main>
-<footer>godbsync 内置监控面板 · 数据来自进度后端（断点/水位）与源/目标实时行数</footer>
+<footer>godbsync 内置监控面板 · 默认仅读进度后端（source_total / written_rows），不查业务库；点「校验一致性」才实时 COUNT(*)</footer>
 
 <script>
 const REFRESH_MS = /*__REFRESH_MS__*/2000;
-let timer = null, paused = false;
+let timer = null, paused = false, verifyMode = false;
 
 function fmt(n){ return n == null ? "—" : n.toLocaleString("en-US"); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
@@ -106,11 +123,14 @@ function render(ov){
     const p = r.progress == null ? "" :
       `<span class="pbar"><i style="width:${Math.min(100, r.progress).toFixed(1)}%"></i></span>` +
       `<span class="pct">${r.progress.toFixed(1)}%</span>`;
+    // 已写入优先显示 syncer 上报的 written_rows（实时），回退显示 target（COUNT*）
+    const written = r.written_rows != null ? r.written_rows : r.target;
     return `<tr>
       <td>${escapeHtml(r.table)}</td>
       <td>${escapeHtml(r.mode)}</td>
       <td><span class="badge ${r.state}">${escapeHtml(r.state)}</span></td>
       <td class="num">${fmt(r.source)}</td>
+      <td class="num" style="color:var(--ok);font-weight:600">${fmt(written)}</td>
       <td class="num">${fmt(r.target)}</td>
       <td class="num">${fmt(r.delta)}</td>
       <td>${p}</td>
@@ -118,19 +138,37 @@ function render(ov){
     </tr>`;
   }).join("");
   document.getElementById("rows").innerHTML = rows ||
-    `<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">没有匹配的表</td></tr>`;
+    `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">没有匹配的表</td></tr>`;
 
   document.getElementById("updated").textContent =
-    "最后更新：" + ov.generated_at + (ov.quick ? "（quick 模式：仅断点/水位，不含实时行数）" : "");
+    "最后更新：" + ov.generated_at + (ov.live ? "（实时校验：含源/目标 COUNT(*)）" : "（仅进度后端，不查业务库）");
+
+  // —— 整体进度/状态（跨表汇总，纯计算派生）——
+  const o = ov.overall || {};
+  const ob = document.getElementById("overall-badge");
+  ob.textContent = o.label || "—";
+  ob.className = "badge " + (o.state || "");
+  document.getElementById("overall-text").textContent =
+    (o.tables_done || 0) + " / " + (o.tables_total || 0) + " 表完成";
+  const op = o.progress == null ? 0 : Math.min(100, o.progress);
+  document.getElementById("overall-fill").style.width = op.toFixed(1) + "%";
+  document.getElementById("overall-pct").textContent = o.progress == null ? "—" : o.progress.toFixed(1) + "%";
 }
 
 function tick(){
-  fetch("/api/status").then(r => { if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  const url = verifyMode ? "/api/status?verify=1" : "/api/status";
+  fetch(url).then(r => { if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(ov => {
       render(ov);
       document.getElementById("dot").className = "dot live";
-      document.getElementById("status").textContent = "实时";
-      document.getElementById("banner").style.display = "none";
+      document.getElementById("status").textContent = verifyMode ? "校验中" : "实时";
+      const b = document.getElementById("banner");
+      if(ov.error){
+        b.style.display = "block";
+        b.textContent = "一致性校验失败：" + ov.error + "（进度仍基于进度后端，不受影响）";
+      } else {
+        b.style.display = "none";
+      }
     })
     .catch(e => {
       document.getElementById("dot").className = "dot err";
@@ -157,7 +195,13 @@ document.getElementById("interval").addEventListener("change", schedule);
 document.getElementById("pause").addEventListener("click", e => {
   paused = !paused;
   e.target.textContent = paused ? "继续" : "暂停";
-  document.getElementById("status").textContent = paused ? "已暂停" : "实时";
+  document.getElementById("status").textContent = paused ? "已暂停" : (verifyMode ? "校验中" : "实时");
+});
+document.getElementById("verify").addEventListener("click", e => {
+  verifyMode = !verifyMode;
+  e.target.textContent = verifyMode ? "停止校验" : "校验一致性";
+  e.target.style.background = verifyMode ? "#ddf4ff" : "";
+  tick();
 });
 
 tick();
