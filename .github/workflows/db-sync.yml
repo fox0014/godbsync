@@ -1,0 +1,503 @@
+name: db-sync
+
+# =============================================================================
+# godbsync 跨库同步矩阵
+#
+# 目的：把「起两个库 → 造数据 → 建表 → 全量 → 校验 → 增量 → 再校验」整条链路
+#      在 CI 里跑一遍，覆盖 4 个方言两两组合的全部 6 对、双向共 12 个方向，
+#      外加 MySQL→MySQL 作为基线。
+#
+# 分层（避免每个 PR 都烧掉大量分钟数）：
+#   layer=fast  拉取/启动都快的方向（mysql2mysql / pg2mysql / sqlserver2mysql）
+#               → push 与 pull_request 都跑
+#   layer=full  含 Oracle 的方向（镜像 ~2.5GB、就绪 ~90s）
+#               → 仅 workflow_dispatch 与每周 cron 跑
+#
+# 断言方式：用 `godbsync validate` 的退出码，它内部做「行数比对 + 主键抽样逐列比对
+#          + 另一区间校验和」，比 grep 日志更可靠，也不依赖日志文案。
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      direction:
+        description: '只跑指定方向（如 oracle2mysql），留空跑全部'
+        type: string
+        default: ''
+  schedule:
+    # 每周一 02:00 (UTC+8) 全量回归
+    - cron: '0 18 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-sync-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # 全流程统一的数据库口令，单一来源。
+  # 约束：满足 SQL Server 复杂度（大写+小写+数字，≥8 位），且不含
+  # # ! $ @ 等会被 shell / YAML / DSN 二次解析的字符。
+  #
+  # 注意：下面 4 个 service 的 env 里各有一份字面量副本（services 段无法引用
+  # 这里的 env 上下文）。改口令时必须同步改：本行 + src/dst 两个 service 的
+  # 5 个 *PASSWORD 变量，共 11 处，否则容器起的口令与 godbsync 连接用的不一致。
+  DB_PASS: SyncCi2024pw
+  GOFLAGS: -mod=mod
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 纯静态检查 + 单元测试：不需要任何数据库，先跑，失败就快速反馈
+  # ---------------------------------------------------------------------------
+  unit:
+    name: unit / vet / gofmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  # ---------------------------------------------------------------------------
+  # 跨库同步矩阵
+  # ---------------------------------------------------------------------------
+  sync:
+    name: ${{ matrix.name }}
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Oracle→SQL Server / SQL Server→Oracle 在 AGENTS.md 中未明确标注为已支持，
+    # 先以「允许失败」的姿态纳入矩阵：失败不红，但结果能在页面上看到。
+    # `|| false` 是必须的：未声明 experimental 的矩阵项该字段为 null，
+    # 直接传给 continue-on-error 会类型不匹配。
+    continue-on-error: ${{ matrix.experimental || false }}
+    # 分层过滤 + 手动指定方向。
+    # 注意第二个条件必须先判 event_name：非 workflow_dispatch 时
+    # github.event.inputs.direction 为 null，`null == ''` 求值为 false，
+    # 会让 push/schedule 的 job 全被跳过。
+    if: >-
+      (github.event_name != 'pull_request' || matrix.layer == 'fast')
+      && (github.event_name != 'workflow_dispatch'
+          || github.event.inputs.direction == ''
+          || matrix.name == github.event.inputs.direction)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- fast：无 Oracle，PR 也跑 ----
+          - { name: mysql2mysql,     layer: fast, src: mysql,      dst: mysql,      s_img: 'mysql:8.0',                              s_port: 3306, d_img: 'mysql:8.0',                              d_port: 3306 }
+          - { name: pg2mysql,        layer: fast, src: postgresql, dst: mysql,      s_img: 'postgres:16-alpine',                     s_port: 5432, d_img: 'mysql:8.0',                              d_port: 3306 }
+          - { name: sqlserver2mysql, layer: fast, src: sqlserver,  dst: mysql,      s_img: 'mcr.microsoft.com/mssql/server:2022-latest', s_port: 1433, d_img: 'mysql:8.0',                          d_port: 3306 }
+          # ---- full：含 Oracle 或双向的另一半 ----
+          - { name: mysql2pg,        layer: full, src: mysql,      dst: postgresql, s_img: 'mysql:8.0',                              s_port: 3306, d_img: 'postgres:16-alpine',                     d_port: 5432 }
+          - { name: mysql2sqlserver, layer: full, src: mysql,      dst: sqlserver,  s_img: 'mysql:8.0',                              s_port: 3306, d_img: 'mcr.microsoft.com/mssql/server:2022-latest', d_port: 1433 }
+          - { name: mysql2oracle,    layer: full, src: mysql,      dst: oracle,     s_img: 'mysql:8.0',                              s_port: 3306, d_img: 'gvenzl/oracle-free:23-slim',             d_port: 1521 }
+          - { name: pg2sqlserver,    layer: full, src: postgresql, dst: sqlserver,  s_img: 'postgres:16-alpine',                     s_port: 5432, d_img: 'mcr.microsoft.com/mssql/server:2022-latest', d_port: 1433 }
+          - { name: pg2oracle,       layer: full, src: postgresql, dst: oracle,     s_img: 'postgres:16-alpine',                     s_port: 5432, d_img: 'gvenzl/oracle-free:23-slim',             d_port: 1521 }
+          - { name: oracle2mysql,    layer: full, src: oracle,     dst: mysql,      s_img: 'gvenzl/oracle-free:23-slim',             s_port: 1521, d_img: 'mysql:8.0',                              d_port: 3306 }
+          - { name: oracle2pg,       layer: full, src: oracle,     dst: postgresql, s_img: 'gvenzl/oracle-free:23-slim',             s_port: 1521, d_img: 'postgres:16-alpine',                     d_port: 5432 }
+          - { name: sqlserver2pg,    layer: full, src: sqlserver,  dst: postgresql, s_img: 'mcr.microsoft.com/mssql/server:2022-latest', s_port: 1433, d_img: 'postgres:16-alpine',                    d_port: 5432 }
+          # ---- 实验性：文档未明确声明支持的反向组合 ----
+          - { name: oracle2sqlserver,  layer: full, experimental: true, src: oracle,    dst: sqlserver, s_img: 'gvenzl/oracle-free:23-slim', s_port: 1521, d_img: 'mcr.microsoft.com/mssql/server:2022-latest', d_port: 1433 }
+          - { name: sqlserver2oracle,  layer: full, experimental: true, src: sqlserver, dst: oracle,    s_img: 'mcr.microsoft.com/mssql/server:2022-latest', s_port: 1433, d_img: 'gvenzl/oracle-free:23-slim', d_port: 1521 }
+
+    # 四个方言的容器初始化参数差异全部塞进 env：
+    # 各自镜像只认自己那几个变量，多余的变量会被忽略，故可以用统一的超集。
+    services:
+      src:
+        image: ${{ matrix.s_img }}
+        env:
+          MYSQL_ROOT_PASSWORD: SyncCi2024pw
+          MYSQL_DATABASE: srcdb
+          POSTGRES_PASSWORD: SyncCi2024pw
+          POSTGRES_DB: srcdb
+          ACCEPT_EULA: 'Y'
+          MSSQL_SA_PASSWORD: SyncCi2024pw
+          MSSQL_PID: Developer
+          ORACLE_PASSWORD: SyncCi2024pw
+          APP_USER: GODBSYNC
+          APP_USER_PASSWORD: SyncCi2024pw
+        ports:
+          - 21000:${{ matrix.s_port }}
+      dst:
+        image: ${{ matrix.d_img }}
+        env:
+          MYSQL_ROOT_PASSWORD: SyncCi2024pw
+          MYSQL_DATABASE: dstdb
+          POSTGRES_PASSWORD: SyncCi2024pw
+          POSTGRES_DB: dstdb
+          ACCEPT_EULA: 'Y'
+          MSSQL_SA_PASSWORD: SyncCi2024pw
+          MSSQL_PID: Developer
+          ORACLE_PASSWORD: SyncCi2024pw
+          APP_USER: GODBSYNC
+          APP_USER_PASSWORD: SyncCi2024pw
+        ports:
+          - 22000:${{ matrix.d_port }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 解析方言连接参数
+        env:
+          SRC: ${{ matrix.src }}
+          DST: ${{ matrix.dst }}
+        run: |
+          set -euo pipefail
+          # 输出格式：user|database|service|schema
+          # oracle 的 schema 必须大写：all_constraints.owner 是大写，小写查不到主键。
+          resolve() {
+            local dialect=$1 which=$2 db
+            if [ "$which" = src ]; then db=srcdb; else db=dstdb; fi
+            case "$dialect" in
+              mysql)      printf 'root|%s||\n'                "$db" ;;
+              postgresql) printf 'postgres|%s||public\n'      "$db" ;;
+              sqlserver)  printf 'sa|%s||dbo\n'               "$db" ;;
+              oracle)     printf 'GODBSYNC||FREEPDB1|GODBSYNC\n' ;;
+              *) echo "未知方言: $dialect" >&2; return 1 ;;
+            esac
+          }
+          IFS='|' read -r SRC_USER SRC_DB SRC_SERVICE SRC_SCHEMA <<< "$(resolve "$SRC" src)"
+          IFS='|' read -r DST_USER DST_DB DST_SERVICE DST_SCHEMA <<< "$(resolve "$DST" dst)"
+          {
+            echo "SRC=$SRC";                  echo "DST=$DST"
+            echo "SRC_USER=$SRC_USER";        echo "DST_USER=$DST_USER"
+            echo "SRC_DB=$SRC_DB";            echo "DST_DB=$DST_DB"
+            echo "SRC_SERVICE=$SRC_SERVICE";  echo "DST_SERVICE=$DST_SERVICE"
+            echo "SRC_SCHEMA=$SRC_SCHEMA";    echo "DST_SCHEMA=$DST_SCHEMA"
+          } >> "$GITHUB_ENV"
+          echo "方向 $SRC → $DST"
+
+      - name: 等待两个库就绪并灌入种子数据
+        env:
+          SRC_CID: ${{ job.services.src.id }}
+          DST_CID: ${{ job.services.dst.id }}
+        run: |
+          set -euo pipefail
+          chmod +x testdata/ci/dbctl.sh
+
+          wait_db() {  # dialect cid user pass db service
+            DB_DIALECT=$1 DB_CID=$2 DB_USER=$3 DB_PASS="$DB_PASS" \
+            DB_NAME=$5 DB_SERVICE=$6 testdata/ci/dbctl.sh wait
+          }
+          create_db() {
+            DB_DIALECT=$1 DB_CID=$2 DB_USER=$3 DB_PASS="$DB_PASS" \
+            DB_NAME=$5 DB_SERVICE=$6 testdata/ci/dbctl.sh createdb
+          }
+          load_seed() {  # dialect cid user pass db service file
+            DB_DIALECT=$1 DB_CID=$2 DB_USER=$3 DB_PASS="$DB_PASS" \
+            DB_NAME=$5 DB_SERVICE=$6 testdata/ci/dbctl.sh file "$7"
+          }
+
+          # 源库：等待 → 建库 → 灌种子
+          wait_db   "$SRC" "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE"
+          create_db "$SRC" "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE"
+          load_seed "$SRC" "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" "testdata/seed/$SRC.sql"
+
+          # 目标库：等待 → 建库（不灌数据，由 godbsync 自己建表）
+          wait_db   "$DST" "$DST_CID" "$DST_USER" "$DB_PASS" "$DST_DB" "$DST_SERVICE"
+          create_db "$DST" "$DST_CID" "$DST_USER" "$DB_PASS" "$DST_DB" "$DST_SERVICE"
+
+      - name: 生成 CI 配置
+        run: |
+          set -euo pipefail
+          gen_config() {
+            local file=$1 tables=$2
+            cat > "$file" <<EOF
+          source:
+            dialect: ${SRC}
+            host: 127.0.0.1
+            port: 21000
+            username: "${SRC_USER}"
+            password: "${DB_PASS}"
+            service: "${SRC_SERVICE}"
+            database: "${SRC_DB}"
+            schema: "${SRC_SCHEMA}"
+            charset: utf8mb4
+            timezone: UTC
+
+          target:
+            dialect: ${DST}
+            host: 127.0.0.1
+            port: 22000
+            username: "${DST_USER}"
+            password: "${DB_PASS}"
+            service: "${DST_SERVICE}"
+            database: "${DST_DB}"
+            schema: "${DST_SCHEMA}"
+
+          state:
+            backend: sqlite
+            path: ci-state.db
+
+          workers: 4
+          log_level: info
+          auto_validate: true
+          validate_sample_size: 200
+          # 1200 行的 T_ANCHOR 会被切成 3 批，覆盖有序窗口与并发提交路径。
+          batch_size: 400
+          watermark_checkpoint_interval: 1
+          batch_timeout: 120s
+
+          ${tables}
+          EOF
+          }
+
+          gen_config ci-full.yaml "tables:
+            - { name: T_ANCHOR,   mode: full, truncate: true }
+            - { name: T_TYPES,    mode: full, truncate: true }
+            - { name: T_RESERVED, mode: full, truncate: true }
+            - { name: T_NOPK,     mode: full, truncate: true }
+            - { name: T_EMPTY,    mode: full, truncate: true }"
+
+          # 增量专用配置：只跑 T_ANCHOR，水位列 UPDATED_AT，
+          # 且复用同一个 state 文件，让水位与全量断点落在同一个后端里。
+          gen_config ci-incr.yaml "tables:
+            - { name: T_ANCHOR,   mode: incremental, watermark: UPDATED_AT }"
+
+          echo '--- ci-full.yaml ---'; sed -n '1,60p' ci-full.yaml
+
+      - name: 构建
+        run: |
+          set -euo pipefail
+          go build -ldflags="-s -w" -o godbsync .
+          ./godbsync version
+
+      - name: init（按源表结构建目标表）
+        run: ./godbsync init -config ci-full.yaml
+
+      - name: full（全量同步 + 内置自动校验）
+        run: ./godbsync full -config ci-full.yaml
+
+      - name: validate（行数 + 主键抽样逐列比对）
+        run: ./godbsync validate -config ci-full.yaml
+
+      - name: full 重跑（验证 truncate 幂等）
+        run: ./godbsync full -config ci-full.yaml
+
+      - name: validate 重跑
+        run: ./godbsync validate -config ci-full.yaml
+
+      - name: 增量首跑（无水位 → 全量拉取并建立水位）
+        run: ./godbsync incr -config ci-incr.yaml
+
+      - name: 往源库追加 3 行（制造增量）
+        env:
+          SRC_CID: ${{ job.services.src.id }}
+        run: |
+          set -euo pipefail
+          run_sql() {
+            DB_DIALECT=$1 DB_CID=$2 DB_USER=$3 DB_PASS="$DB_PASS" \
+            DB_NAME=$5 DB_SERVICE=$6 testdata/ci/dbctl.sh exec "$7"
+          }
+          case "$SRC" in
+            mysql)
+              run_sql mysql "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" \
+                "INSERT INTO T_ANCHOR (NAME, AMOUNT, UPDATED_AT) VALUES ('incr-1',1.1000,'2025-06-01 00:00:01'),('incr-2',2.2000,'2025-06-01 00:00:02'),('incr-3',3.3000,'2025-06-01 00:00:03')" ;;
+            postgresql)
+              run_sql postgresql "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" \
+                "INSERT INTO T_ANCHOR (NAME, AMOUNT, UPDATED_AT) VALUES ('incr-1',1.1000,TIMESTAMP '2025-06-01 00:00:01'),('incr-2',2.2000,TIMESTAMP '2025-06-01 00:00:02'),('incr-3',3.3000,TIMESTAMP '2025-06-01 00:00:03')" ;;
+            sqlserver)
+              run_sql sqlserver "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" \
+                "INSERT INTO T_ANCHOR (NAME, AMOUNT, UPDATED_AT) VALUES (N'incr-1',1.1000,'2025-06-01T00:00:01'),(N'incr-2',2.2000,'2025-06-01T00:00:02'),(N'incr-3',3.3000,'2025-06-01T00:00:03')" ;;
+            oracle)
+              run_sql oracle "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" \
+                "INSERT INTO T_ANCHOR (NAME, AMOUNT, UPDATED_AT) VALUES ('incr-1',1.1000,TIMESTAMP '2025-06-01 00:00:01')" 
+              run_sql oracle "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" \
+                "INSERT INTO T_ANCHOR (NAME, AMOUNT, UPDATED_AT) VALUES ('incr-2',2.2000,TIMESTAMP '2025-06-01 00:00:02')"
+              run_sql oracle "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" \
+                "INSERT INTO T_ANCHOR (NAME, AMOUNT, UPDATED_AT) VALUES ('incr-3',3.3000,TIMESTAMP '2025-06-01 00:00:03')"
+              run_sql oracle "$SRC_CID" "$SRC_USER" "$DB_PASS" "$SRC_DB" "$SRC_SERVICE" "COMMIT" ;;
+          esac
+
+      - name: 增量二次运行（应只追加 3 行）
+        run: ./godbsync incr -config ci-incr.yaml
+
+      - name: validate（增量后仍一致）
+        run: ./godbsync validate -config ci-full.yaml
+
+      - name: 查看同步状态
+        if: always()
+        run: ./godbsync monitor -cli -config ci-full.yaml --verify || true
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo ""
+            echo '| 项 | 值 |'
+            echo '| --- | --- |'
+            echo "| 源 | \`${{ matrix.src }}\` → \`${{ matrix.dst }}\` |"
+            echo "| 结果 | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # MySQL 目标版本降级矩阵
+  #
+  # 源固定 mysql:8.0（带 JSON / utf8mb4_0900_ai_ci / DATETIME(6)），
+  # 目标依次跑 8.0 → 5.7 → 5.6 → 5.5，专门验证 GenerateCreate 的版本探测与降级：
+  #   JSON               → <5.7 降为 LONGTEXT
+  #   utf8mb4_0900_*     → <8.0 降为 utf8mb4_general_ci
+  #   DATETIME(6)        → <5.6.4 去掉微秒参数
+  #
+  # 5.6/5.5 的官方镜像已停止维护，在新内核上可能起不来，故标记为非严格：
+  # 失败不会让流水线变红，但构建页面上仍能看到具体错在哪 —— 这正是需要人判断的地方。
+  # ---------------------------------------------------------------------------
+  mysql-versions:
+    name: ddl-downgrade / dst-${{ matrix.tag }}
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: ${{ !matrix.strict }}
+    if: >-
+      github.event_name != 'pull_request'
+      && (github.event_name != 'workflow_dispatch'
+          || github.event.inputs.direction == ''
+          || github.event.inputs.direction == 'mysql-versions')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { tag: '8.0', strict: true }
+          - { tag: '5.7', strict: true }
+          - { tag: '5.6', strict: false }
+          - { tag: '5.5', strict: false }
+    services:
+      src:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: SyncCi2024pw
+          MYSQL_DATABASE: srcdb
+        ports:
+          - 21000:3306
+      dst:
+        image: mysql:${{ matrix.tag }}
+        env:
+          MYSQL_ROOT_PASSWORD: SyncCi2024pw
+          MYSQL_DATABASE: dstdb
+        ports:
+          - 22000:3306
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 等待两个库并灌入种子（含 8.0 专属列）
+        env:
+          SRC_CID: ${{ job.services.src.id }}
+          DST_CID: ${{ job.services.dst.id }}
+        run: |
+          set -euo pipefail
+          chmod +x testdata/ci/dbctl.sh
+
+          run_dbctl() {  # cid subcmd [args]
+            local cid=$1; shift
+            DB_DIALECT=mysql DB_CID="$cid" DB_USER=root DB_PASS="$DB_PASS" \
+            DB_NAME=${DB_NAME:-srcdb} testdata/ci/dbctl.sh "$@"
+          }
+
+          DB_NAME=srcdb run_dbctl "$SRC_CID" wait
+          DB_NAME=srcdb run_dbctl "$SRC_CID" file testdata/seed/mysql.sql
+          DB_NAME=srcdb run_dbctl "$SRC_CID" file testdata/seed/mysql-modern.sql
+
+          DB_NAME=dstdb run_dbctl "$DST_CID" wait
+
+      - name: 生成配置
+        run: |
+          set -euo pipefail
+          cat > ci-downgrade.yaml <<EOF
+          source:
+            dialect: mysql
+            host: 127.0.0.1
+            port: 21000
+            username: "root"
+            password: "${DB_PASS}"
+            database: "srcdb"
+            charset: utf8mb4
+            timezone: UTC
+
+          target:
+            dialect: mysql
+            host: 127.0.0.1
+            port: 22000
+            username: "root"
+            password: "${DB_PASS}"
+            database: "dstdb"
+
+          state:
+            backend: sqlite
+            path: ci-downgrade.db
+
+          workers: 4
+          log_level: info
+          auto_validate: true
+          batch_size: 400
+
+          tables:
+            - { name: T_ANCHOR, mode: full, truncate: true }
+            - { name: T_MODERN, mode: full, truncate: true }
+          EOF
+
+      - name: 构建 + 建表 + 全量 + 校验
+        run: |
+          set -euo pipefail
+          go build -ldflags="-s -w" -o godbsync .
+          ./godbsync init     -config ci-downgrade.yaml
+          ./godbsync full     -config ci-downgrade.yaml
+          ./godbsync validate -config ci-downgrade.yaml
+
+      - name: 打印目标端实际建出来的 DDL（降级是否生效，一眼可见）
+        if: always()
+        env:
+          DST_CID: ${{ job.services.dst.id }}
+        run: |
+          docker exec "$DST_CID" mysql -uroot -p"$DB_PASS" dstdb \
+            -e "SHOW CREATE TABLE T_MODERN\G" || true
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "### DDL 降级：目标 mysql:${{ matrix.tag }}"
+            echo ""
+            echo "严格模式：${{ matrix.strict }}　结果：${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+

@@ -136,7 +136,7 @@ func (s *Syncer) ensureTable(t config.TableConfig) error {
 		mappedPK[i] = t.TargetColName(k)
 	}
 
-	ddl, err := s.writer.GenerateCreate(s.targetDB, t.TargetName(), mappedCols, mappedPK)
+	ddl, err := s.generateCreate(t, target, srcRef, mappedCols, mappedPK)
 	if err != nil {
 		s.log.Errorf("目标表 %s 创建失败：生成 DDL 失败: %v", target, err)
 		return err
@@ -147,6 +147,26 @@ func (s *Syncer) ensureTable(t config.TableConfig) error {
 	}
 	s.log.Infof("目标表 %s 创建成功（源表 %s）", target, t.Name)
 	return nil
+}
+
+// generateCreate 生成建表语句。若目标方言支持表级属性还原（dialect.TableMetaWriter），
+// 则先尽力读取源表级属性（ENGINE/默认字符集/排序规则/表注释）并传入；源方言不支持
+// （dialect.TableMetaReader 未实现）或读取失败时退化为零值，目标方言按默认值建表。
+func (s *Syncer) generateCreate(t config.TableConfig, target, srcRef string, cols []types.Column, pk []string) (string, error) {
+	mw, ok := s.writer.(dialect.TableMetaWriter)
+	if !ok {
+		return s.writer.GenerateCreate(s.targetDB, target, cols, pk)
+	}
+	var meta types.TableMeta
+	if mr, ok := s.reader.(dialect.TableMetaReader); ok {
+		m, err := mr.TableMeta(s.sourceDB, srcRef)
+		if err != nil {
+			s.log.Warnf("源表 %s 表级属性读取失败，按目标默认建表: %v", srcRef, err)
+		} else {
+			meta = m
+		}
+	}
+	return mw.GenerateCreateWithMeta(s.targetDB, target, cols, pk, meta)
 }
 
 func (s *Syncer) anchorString(v interface{}, dbType string) string {

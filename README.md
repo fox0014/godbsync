@@ -221,6 +221,27 @@ godbsync/
 
 ## 类型映射
 
+**MySQL → MySQL（保真建表）：**
+
+| MySQL 源列定义（`INFORMATION_SCHEMA.COLUMNS.COLUMN_TYPE`） | MySQL 目标 |
+| --- | --- |
+| `varchar(n)` / `char(n)` / `tinyint(1)` / `int unsigned` / `bigint` / `decimal(p,s)` / `float` / `double` | 原样沿用（不再按基础类型名重新映射） |
+| `text` / `tinytext` / `mediumtext` / `longtext` / `blob` 系列 / `binary(n)` / `varbinary(n)` | 原样沿用 |
+| `datetime` / `timestamp(n)` / `time(n)` / `date` / `year` / `bit(n)` / `json` | 原样沿用（源无微秒精度就建 `datetime`，不统一提升为 `DATETIME(6)`） |
+| `enum(...)` / `set(...)` | 原样沿用（保留全部枚举取值） |
+| `CHARACTER_SET_NAME` / `COLLATION_NAME` | 逐列输出 `CHARACTER SET ... COLLATE ...` |
+| `NOT NULL` / `DEFAULT` / `COMMENT` | 保留；8.0.13+ 表达式默认值输出为 `DEFAULT (表达式)` |
+| `AUTO_INCREMENT`（列属性） | 保留为列属性 `AUTO_INCREMENT`；**必须位于主键首列**，否则建表报错（MySQL 语法要求） |
+| `AUTO_INCREMENT=n`（表计数器） | 存在自增列且源 `TABLES.AUTO_INCREMENT` 非 NULL 时，输出 `) ... AUTO_INCREMENT=<源值>`；源值为 NULL 则不输出（目标自然从 `max(id)+1` 起） |
+| `ON UPDATE CURRENT_TIMESTAMP` | 保留（仅 `datetime`/`timestamp` 列合法，精度随列类型，如 `datetime(6)` → `ON UPDATE CURRENT_TIMESTAMP(6)`） |
+| 生成列 `GENERATED ALWAYS AS (表达式) VIRTUAL/STORED` | 表达式原样输出，类型（`VIRTUAL`/`STORED`）保留；生成列不输出 `DEFAULT`/`AUTO_INCREMENT`/`ON UPDATE` |
+| 表 `ENGINE` / `DEFAULT CHARSET` / `COLLATE` / `COMMENT` | 按源表 `INFORMATION_SCHEMA.TABLES` 原样输出到表尾（如 `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='工种系数表'`）；表注释单引号/反斜杠安全转义，无注释不输出 `COMMENT`，非法取值降级 |
+| 主键 | 与原表一致 |
+
+> 表尾选项取值来自源表元数据；源方言不支持表级属性（如 Oracle → MySQL）或读取失败时，回退为 `ENGINE=InnoDB DEFAULT CHARSET=<目标默认>`，与旧行为一致。目标版本低于 8.0 时，源端 8.0 专有的 `*_0900_*` 排序规则自动降级为 `utf8mb4_general_ci`/`utf8mb4_bin`；低于 8.0.29 的 `utf8mb3` 降为 `utf8`；低于 5.5.3 的 `utf8mb4` 降为 `utf8`；低于 5.7 时 `json` 降级为 `LONGTEXT`；低于 5.6.4 时去掉 `datetime/timestamp/time` 的微秒精度参数。
+>
+> **仍未搬迁的表级属性**（本工具刻意未做）：二级索引（普通 `KEY` / `UNIQUE` / `FULLTEXT` / 前缀索引）、外键。`ENGINE` 原样沿用，若目标库不支持源引擎（如源 MyISAM、目标仅 InnoDB 的托管实例）建表会报错；此时请手工建表或改源引擎。
+
 **Oracle → MySQL：**
 
 | Oracle | MySQL |
@@ -374,7 +395,7 @@ godbsync/
 - SQL Server 目标库批写入用 `MERGE ... USING (VALUES ...)`，单条语句最多 1000 行，工具已自动分块；建表用 `CREATE TABLE IF NOT EXISTS`。
 - 连接加密：SQL Server 源/目标的 `encrypt` 字段留空默认 `encrypt=disable`（兼容自签名/内网）；连 Azure SQL 或开启强制加密的实例设 `encrypt: true`（自动加 `trustservercertificate=true`）。
 
-**时间列精度**：工具建表用 `DATETIME(6)`（微秒），但旧表可能只有 `DATETIME`（秒级），写入时小数秒会四舍五入导致校验不一致。修复：`ALTER TABLE \`<表>\` MODIFY \`<列>\` DATETIME(6);` 后重跑全量。
+**时间列精度**：跨方言建表用 `DATETIME(6)`（微秒，避免 Oracle/SQL Server/PostgreSQL 源的亚秒精度丢失），但旧表可能只有 `DATETIME`（秒级），写入时小数秒会四舍五入导致校验不一致。修复：`ALTER TABLE \`<表>\` MODIFY \`<列>\` DATETIME(6);` 后重跑全量。**MySQL→MySQL 例外**：源端时间列精度按 `COLUMN_TYPE` 原文保留（源为 `datetime` 就建 `datetime`），不做统一提升。
 
 ## 构建
 

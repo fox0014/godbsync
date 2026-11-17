@@ -1,0 +1,63 @@
+# =============================================================================
+# godbsync 本地复现环境：起 5 个数据库容器，覆盖 4 个方言的任意组合。
+#
+#   docker compose -f testdata/local/docker-compose.yml up -d              # 全起（含 Oracle，约 4GB 镜像）
+#   docker compose -f testdata/local/docker-compose.yml up -d mysql1 mysql2 # 只起需要的
+#
+# 端口刻意避开本机可能已有的 3306/5432/1433/1521：
+#   mysql1(源) 33061   mysql2(目标) 33062   pg 5433   mssql 14330   oracle 15210
+# =============================================================================
+
+name: godbsync-local
+
+services:
+  mysql1:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASS:-SyncCi2024pw}
+      MYSQL_DATABASE: srcdb
+    ports:
+      - "33061:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  mysql2:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASS:-SyncCi2024pw}
+      MYSQL_DATABASE: dstdb
+    ports:
+      - "33062:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  pg:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASS:-SyncCi2024pw}
+      POSTGRES_DB: srcdb
+    ports:
+      - "5433:5432"
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${DB_PASS:-SyncCi2024pw}
+      MSSQL_PID: Developer
+    ports:
+      - "14330:1433"
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    environment:
+      ORACLE_PASSWORD: ${DB_PASS:-SyncCi2024pw}
+      APP_USER: GODBSYNC
+      APP_USER_PASSWORD: ${DB_PASS:-SyncCi2024pw}
+    ports:
+      - "15210:1521"
+    # Oracle 首次启动要建库，约 1-2 分钟；给足健康检查窗口
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s

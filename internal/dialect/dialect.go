@@ -91,6 +91,19 @@ type Writer interface {
 	Placeholder(n int) string
 }
 
+// TableMetaReader 是 Reader 的可选扩展：源方言可提供表级属性
+// （ENGINE / 默认字符集 / 排序规则 / 表注释），供目标方言在表尾还原。
+// 未实现该接口的源方言不提供表级元数据（目标按默认值建表）。
+type TableMetaReader interface {
+	TableMeta(db *sql.DB, tableRef string) (types.TableMeta, error)
+}
+
+// TableMetaWriter 是 Writer 的可选扩展：目标方言可利用源表级属性生成带表尾选项的
+// CREATE TABLE。未实现该接口时 syncer 回退调用 GenerateCreate，建表行为保持不变。
+type TableMetaWriter interface {
+	GenerateCreateWithMeta(db *sql.DB, table string, cols []types.Column, pk []string, meta types.TableMeta) (string, error)
+}
+
 var (
 	mu      sync.RWMutex
 	readers = map[string]func() Reader{}

@@ -9,5 +9,12 @@ godbsync.db
 /godbsync
 /godbsync.exe
 
+# CI / 本地复现的工作目录与临时配置
+testdata/local/.work/
+ci-*.yaml
+
 # IDE / 工具缓存目录
 .codebuddy/
+
+# AI 工作区数据（项目记忆 / 会话上下文，属本地笔记，不入仓库）
+.workbuddy/

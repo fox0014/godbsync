@@ -42,6 +42,10 @@ go test ./... / go vet ./... / gofmt -l .
 `Writer`（目标）：`Open` / `BulkUpsert` / `Truncate` / `TableExists` / `ExecDDL` /
 `GenerateCreate` / `RowCount` / `PrimaryKey` / `QuoteIdentifier` / `Placeholder`。
 
+可选扩展接口（目前仅 `mysql` 实现，按 Go 接口断言启用，syncer 对未实现者零感知）：
+`TableMetaReader`（`TableMeta(db, tableRef)` 读源表 ENGINE/字符集/排序规则/注释）、
+`TableMetaWriter`（`GenerateCreateWithMeta(...)` 在表尾还原表级选项）。
+
 ### 关键实现差异（已收进接口，syncer 不感知）
 - **类型映射与 DDL**：`oracle` 包内 `oracleType` 生成 Oracle DDL，`mysql` 包内 `mysqlType`
   生成 MySQL DDL，`sqlserver` 包内 `sqlserverType` 生成 SQL Server DDL，`postgresql` 包内 `pgType`
@@ -51,6 +55,38 @@ go test ./... / go vet ./... / gofmt -l .
   MySQL 目标 5.5.x 用 `utf8`+`DATETIME`、5.6.x 加 `DATETIME(6)`、5.7+ 才用 `JSON`（更早 LONGTEXT）；
   Oracle 目标 9i 时 `FLOAT`/`DOUBLE` 源列降级为 `NUMBER`（10g+ 仍 `BINARY_FLOAT`/`BINARY_DOUBLE`）。
   探测失败回退现代版本，已测 5.7+/8.0、12c 路径不变。
+  **MySQL→MySQL 保真**：`mysql.readerTableColumns` 用 `INFORMATION_SCHEMA.COLUMNS` 补充
+  `types.Column.RawType`（`COLUMN_TYPE` 原文，如 `varchar(32)`/`int unsigned`/`enum('a','b')`）、
+  `CharSet`/`Collation`、`Default`、`Comment`；`mysqlTypeForVersion` 见 `RawType` 即原样沿用，
+  `GenerateCreate` 逐列输出字符集/排序规则、`NOT NULL`、`DEFAULT`、`COMMENT`。
+  根因：go-sql-driver 未实现 `RowsColumnTypeLength`，`ColumnType.Length()` 恒返回 `ok=false`，
+  旧路径下 `varchar(n)`/`char(n)` 的 `Length` 为 0 被降级成 `TEXT`/`CHAR(1)`，TEXT 列作主键报
+  Error 1170；故不能仅按 `DBType` 重映射 MySQL 源列。`Length`/`Precision`/`Scale` 仍沿用旧路径取值
+  （`Length` 保持 0），避免改变 MySQL→Oracle/SQL Server/PostgreSQL 的既有 DDL。
+  版本降级：目标 <8.0 时 `*_0900_*` 排序规则降为 `utf8mb4_general_ci`/`utf8mb4_bin`；
+  <5.7 的 `json` → `LONGTEXT`；<5.6.4 去掉时间类型微秒参数。
+  **MySQL→MySQL 列属性与自增计数器**：`enrichColumnsFromInfoSchema` 从 `EXTRA` 解析
+  `AutoIncrement` / `OnUpdateCurrentTimestamp` / `GenerationType`（`STORED`/`VIRTUAL GENERATED`），
+  并从 `GENERATION_EXPRESSION` 取生成列表达式，同一查询 `LEFT JOIN INFORMATION_SCHEMA.TABLES`
+  顺带取 `t.AUTO_INCREMENT` 存入 `AutoIncrementStart`（0=未知/NULL）。`mysqlColumnDef` 按
+  「类型 → charset/collate → 生成列(`GENERATED ALWAYS AS (expr) VIRTUAL|STORED`，不再输出
+  DEFAULT/AI/ON UPDATE) / 普通列(`NOT NULL → DEFAULT → AUTO_INCREMENT → ON UPDATE → COMMENT`)」
+  输出；`AUTO_INCREMENT` 强制要求该列为主键首列，否则返回错误（MySQL 语义：自增列必须为索引首列）。
+  `ON UPDATE CURRENT_TIMESTAMP` 仅对 `datetime`/`timestamp` 输出，精度取其类型精度
+  （`datetime(6)` → `ON UPDATE CURRENT_TIMESTAMP(6)`）。
+  `GenerateCreate` 末尾在存在自增列且 `AutoIncrementStart > 0` 时追加 ` AUTO_INCREMENT=<源值>`
+  （表级计数器随源迁移，避免源库删过尾部后目标 id 段与源重叠；源值为 NULL 不输出，目标从
+  `max(id)+1` 自然起始；目标已有数据的 `max(id)` 更大时 MySQL 会忽略该值）。
+  表级属性**部分搬迁**：`mysql.Reader.TableMeta`（`dialect.TableMetaReader` 可选接口）读
+  `INFORMATION_SCHEMA.TABLES` 的 `ENGINE`/`TABLE_COLLATION`/`TABLE_COMMENT`，字符集由
+  `COLLATION_CHARACTER_SET_APPLICABILITY` 反查（不存在的兼容服务按排序规则名前缀兜底）；
+  `Writer.GenerateCreateWithMeta`（`dialect.TableMetaWriter` 可选接口）在表尾输出
+  `ENGINE=... DEFAULT CHARSET=... COLLATE=... COMMENT='...'`。`syncer.generateCreate` 仅在目标
+  实现 `TableMetaWriter` 时取源表级属性，源方言不支持或读取失败则传零值回退旧输出。
+  `mysqlTableOptions` 的降级规则：ENGINE 非法标识符→InnoDB；charset 非法→目标默认，
+  并按版本降级（<5.5.3 utf8mb4→utf8、<8.0.29 utf8mb3→utf8）；collation 非法或与最终 charset
+  前缀不匹配→省略 COLLATE；表注释为空→不输出 COMMENT，注释经 `mysqlQuotedString` 转义单引号/反斜杠。
+  **明确不搬**：二级索引（KEY/UNIQUE/FULLTEXT）、外键。`ENGINE` 原样沿用，目标不支持该引擎时建表会报错。
 - **幂等写入**：`mysql.BulkUpsert` = `INSERT ... ON DUPLICATE KEY UPDATE`（按占位符上限自动分块）；
   `oracle.BulkUpsert` = `MERGE`（按目标表主键缓存，命中更新非主键列、未命中插入；
   目标表无主键时退化为普通 `INSERT`）；
