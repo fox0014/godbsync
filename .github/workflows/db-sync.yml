@@ -88,11 +88,36 @@ jobs:
         run: go test ./... -count=1
 
   # ---------------------------------------------------------------------------
+  # 矩阵过滤：job 级 if 不支持 matrix 上下文，改由 prepare job 输出方向名列表，
+  # 作为 sync 矩阵的基础维度；静态 include 按 name 匹配补全其余字段。
+  # PR 只输出 fast 层；手动指定方向时只输出该方向；其余情况输出全部。
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      names: ${{ steps.filter.outputs.names }}
+    steps:
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          DIRECTION: ${{ github.event.inputs.direction }}
+        run: |
+          FAST='"mysql2mysql", "pg2mysql", "sqlserver2mysql"'
+          ALL='"mysql2mysql", "pg2mysql", "sqlserver2mysql", "mysql2pg", "mysql2sqlserver", "mysql2oracle", "pg2sqlserver", "pg2oracle", "oracle2mysql", "oracle2pg", "sqlserver2pg", "oracle2sqlserver", "sqlserver2oracle"'
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "names=[$FAST]" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "workflow_dispatch" ] && [ -n "$DIRECTION" ]; then
+            echo "names=[\"$DIRECTION\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo "names=[$ALL]" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
   # 跨库同步矩阵
   # ---------------------------------------------------------------------------
   sync:
     name: ${{ matrix.name }}
-    needs: unit
+    needs: [unit, prepare]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     # Oracle→SQL Server / SQL Server→Oracle 在 AGENTS.md 中未明确标注为已支持，
@@ -100,18 +125,13 @@ jobs:
     # `|| false` 是必须的：未声明 experimental 的矩阵项该字段为 null，
     # 直接传给 continue-on-error 会类型不匹配。
     continue-on-error: ${{ matrix.experimental || false }}
-    # 分层过滤 + 手动指定方向。
-    # 注意第二个条件必须先判 event_name：非 workflow_dispatch 时
-    # github.event.inputs.direction 为 null，`null == ''` 求值为 false，
-    # 会让 push/schedule 的 job 全被跳过。
-    if: >-
-      (github.event_name != 'pull_request' || matrix.layer == 'fast')
-      && (github.event_name != 'workflow_dispatch'
-          || github.event.inputs.direction == ''
-          || matrix.name == github.event.inputs.direction)
+    # 分层与手动过滤由 prepare job 输出的方向名列表驱动，不能在 job 级 if 里用 matrix。
     strategy:
       fail-fast: false
       matrix:
+        # 基础维度：PR 只含 fast，手动指定方向时只含该方向，否则全部 13 个。
+        name: ${{ fromJSON(needs.prepare.outputs.names) }}
+        # 静态配置按 name 匹配补全；未匹配上的字段自动忽略。
         include:
           # ---- fast：无 Oracle，PR 也跑 ----
           - { name: mysql2mysql,     layer: fast, src: mysql,      dst: mysql,      s_img: 'mysql:8.0',                              s_port: 3306, d_img: 'mysql:8.0',                              d_port: 3306 }
